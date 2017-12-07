@@ -19,13 +19,17 @@ package raft
 
 import "sync"
 import "labrpc"
+import "math/rand"
+import "time"
 
 // import "bytes"
 // import "encoding/gob"
 
-const FOLLOWER := 0
-const CANDIDATE := 1
-const LEADER := 2
+const (
+	FOLLOWER  = 0
+	CANDIDATE = 1
+	LEADER    = 2
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -37,6 +41,26 @@ type ApplyMsg struct {
 	Command     interface{}
 	UseSnapshot bool   // ignore for lab2; only used in lab3
 	Snapshot    []byte // ignore for lab2; only used in lab3
+}
+
+type LogEntry struct {
+	term    int
+	index   int
+	content interface{}
+}
+
+type AppendEntriesArgs struct {
+	term         int //leader的term
+	leaderId     int //leader的标识
+	prevLogIndex int //之前log的Index
+	prevLogTerm  int //之前log的term
+	entries      []LogEntry
+	leaderCommit int //leader的commitIndex
+}
+
+type AppendEntriesReply struct {
+	term int //返回的term，用于leader更新自己
+	succ bool
 }
 
 //
@@ -51,10 +75,16 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	
-	electionTimeoutMS int //选举超时时间，时间单位为毫秒
-	nodeRole int //当前节点的角色状态，默认为follower
 
+	electionTimeoutMS          int   //选举超时时间，时间单位为毫秒
+	nodeRole                   int   //当前节点的角色状态，默认为follower
+	currentTerm                int   //当前的term
+	commitIndex                int   //当前已提交的index
+	lastLeaderHeartBeatTime    int64 //上次心跳时，unix时间戳，单位是毫秒
+	raftHeartBeatIntervalMilli int   //raft心跳间隔，单位是毫秒，任务初始化时指定
+	entries                    []LogEntry
+	raftIsShutdown             bool //当前进程是否关闭
+	leaderId                   int  //当前raft节点认为的leader的id
 }
 
 // return currentTerm and whether this server
@@ -120,15 +150,39 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int //用于候选者更新自己当前的term
-	VoteGranted     //投票的结果，如果成功了，那么就返回true
+	Term        int  //用于候选者更新自己当前的term
+	VoteGranted bool //投票的结果，如果成功了，那么就返回true
 }
 
 //
 // example RequestVote RPC handler.
 //
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	reply.term = rf.currentTerm
+	if req.term < rf.currentTerm {
+		reply.succ = false
+		return
+	}
+	lastEntry := rf.entries[len(rf.entries)-1]
+	if lastEntry.term < req.prevLogTerm {
+		rf.nodeRole = FOLLOWER
+		reply.succ = true
+	} else if lastEntry.term == req.prevLogTerm {
+		if len(rf.entries) <= req.prevLogIndex {
+			rf.nodeRole = FOLLOWER
+			reply.succ = true
+		} else {
+			reply.succ = false
+		}
+	} else {
+		reply.succ = false
+	}
+
+}
+
+func (rf *Raft) Heartbeat(req *AppendEntriesArgs, reply *AppendEntriesReply) {
+
 }
 
 //
@@ -162,6 +216,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.Heartbeat", args, reply)
 	return ok
 }
 
@@ -217,9 +276,143 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	//初始化当前参数
+	rf.initParam()
+	//开始选举超时判定任务
+	go rf.electionTimeOutTimer()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+
+//获取当前时间的毫秒数
+func GetNowMilliTime() int64 {
+	return time.Now().UnixNano() / 1000000
+}
+
+func (rf *Raft) electionTimeOutTimer() {
+	for {
+		time.Sleep(time.Duration(rf.electionTimeoutMS) * time.Millisecond)
+		if rf.nodeRole == LEADER {
+			continue
+		}
+		nowTime := GetNowMilliTime()
+		if int(nowTime-lastTime) > rf.electionTimeoutMS || rf.nodeRole == CANDIDATE {
+			go rf.startElection()
+		}
+	}
+}
+
+//Q leader在什么情况下，会退化为follower
+//A
+func (rf *Raft) maintainLeader() {
+	for {
+		time.Sleep(time.Duration(rf.raftHeartBeatIntervalMilli))
+		req := &AppendEntriesArgs{}
+		reply := &AppendEntriesReply{}
+
+		req.leaderCommit = rf.commitIndex
+		req.term = rf.currentTerm
+		req.leaderId = rf.me
+
+		for index, peer := range rf.peers {
+			if index == rf.me {
+				continue
+			}
+			result := rf.sendHeartbeat(index, req, reply)
+			if result {
+				if !reply.succ {
+					if reply.term > rf.currentTerm {
+						rf.currentTerm = reply.term
+						rf.becomeFollwer()
+						return
+					}
+				}
+			} else {
+				println("向%d发送心跳失败", index)
+			}
+		}
+	}
+}
+
+func (rf *Raft) initParam() {
+	rf.currentTerm = 0
+	rf.commitIndex = 0
+	rf.nodeRole = FOLLOWER
+	rf.setElectionTimeOut()
+	rf.raftHeartBeatIntervalMilli = 50
+	rf.lastLeaderHeartBeatTime = GetNowMilliTime()
+}
+
+func (rf *Raft) setElectionTimeOut() {
+	rf.electionTimeoutMS = produceElectionTimeoutParam()
+}
+
+func produceElectionTimeoutParam() int {
+	return RandInt(150, 300)
+}
+
+func RandInt(start, end int) int {
+	cha := end - start
+	n := rand.Intn(cha)
+	return n + start
+}
+
+func (rf *Raft) startElection() {
+	if rf.nodeRole != CANDIDATE {
+		rf.nodeRole = CANDIDATE
+	}
+	rf.leaderId = -1
+	succ := 0
+	majority := (len(rf.peers) + 1) / 2
+	rf.currentTerm++
+	rf.setElectionTimeOut()
+	voteResult = make(chan map[int]int)
+	for index, peer := range rf.peers {
+		if index == rf.me {
+			continue
+		}
+		go func() {
+			voteArgs := &RequestVoteArgs{}
+			voteArgs.Term = rf.currentTerm
+			voteArgs.CandidateId = rf.me
+			voteArgs.LastLogIndex = 0
+			voteArgs.LastLogTerm = 0
+
+			voteReply := &RequestVoteReply{}
+
+			result := rf.sendRequestVote(index, voteArgs, voteReply)
+			if result {
+				if voteReply.VoteGranted {
+					voteResult[index] <- 1
+				} else {
+					if voteReply.Term > rf.currentTerm {
+						rf.currentTerm = voteReply.Term
+						voteResult[index] <- 0
+					}
+				}
+			} else {
+				println("尝试连接server %d时，网络连接异常", index)
+				voteResult[index] <- 2
+			}
+		}()
+
+	}
+	for key, value := range voteResult {
+		if value == 1 {
+			succ++
+		}
+	}
+	//Q:如何判定在收集候选者期间，已经有leader联系自己了
+	//A:为当前raft设计一个leaderId，代表当前raft承认的leader
+	if rf.leaderId > 0 {
+		rf.nodeRole = FOLLOWER
+	} else if succ >= majority {
+		rf.nodeRole = LEADER
+		go rf.maintainLeader()
+	} else {
+		rf.nodeRole = CANDIDATE
+	}
 }
