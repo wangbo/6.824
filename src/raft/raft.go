@@ -44,23 +44,23 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	term    int
-	index   int
-	content interface{}
+	Term    int
+	Index   int
+	Content interface{}
 }
 
 type AppendEntriesArgs struct {
-	term         int //leader的term
-	leaderId     int //leader的标识
-	prevLogIndex int //之前log的Index
-	prevLogTerm  int //之前log的term
-	entries      []LogEntry
-	leaderCommit int //leader的commitIndex
+	Term         int //leader的term
+	LeaderId     int //leader的标识
+	PrevLogIndex int //之前log的Index
+	PrevLogTerm  int //之前log的term
+	Entries      []LogEntry
+	LeaderCommit int //leader的commitIndex
 }
 
 type AppendEntriesReply struct {
-	term int //返回的term，用于leader更新自己
-	succ bool
+	Term int //返回的term，用于leader更新自己
+	Succ bool
 }
 
 //
@@ -94,11 +94,23 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	if rf.me == 0 {
+	if rf.getRaftRole() == LEADER {
 		isleader = true
 	}
-	term = 0
+	term = rf.getRaftTerm()
 	return term, isleader
+}
+
+func (rf *Raft) setRaftRole(role int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.nodeRole = role
+}
+
+func (rf *Raft) getRaftRole() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.nodeRole
 }
 
 //
@@ -159,30 +171,46 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	reply.term = rf.currentTerm
-	if req.term < rf.currentTerm {
-		reply.succ = false
+	reply.Term = rf.getRaftTerm()
+	if req.Term < rf.getRaftTerm() {
+		reply.VoteGranted = false
 		return
 	}
+
 	lastEntry := rf.entries[len(rf.entries)-1]
-	if lastEntry.term < req.prevLogTerm {
-		rf.nodeRole = FOLLOWER
-		reply.succ = true
-	} else if lastEntry.term == req.prevLogTerm {
-		if len(rf.entries) <= req.prevLogIndex {
-			rf.nodeRole = FOLLOWER
-			reply.succ = true
+	if lastEntry.Term > req.LastLogTerm {
+		reply.VoteGranted = false
+		return
+	} else if lastEntry.Term == req.LastLogTerm {
+		if rf.commitIndex <= req.LastLogIndex {
+			rf.setRaftRole(FOLLOWER)
+			rf.setRaftLeaderId(req.CandidateId)
+			reply.VoteGranted = true
+			rf.setRaftTerm(req.Term)
 		} else {
-			reply.succ = false
+			reply.VoteGranted = false
 		}
 	} else {
-		reply.succ = false
+		rf.setRaftRole(FOLLOWER)
+		rf.setRaftLeaderId(req.CandidateId)
+		reply.VoteGranted = true
+		rf.setRaftTerm(req.Term)
 	}
 
 }
 
-func (rf *Raft) Heartbeat(req *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply) {
+	//	println("1906:", req == nil, reply == nil)
+	if len(req.Entries) == 0 {
+		if rf.getRaftTerm() <= req.Term {
+			rf.setLastLeaderHeartBeatTime()
+			reply.Succ = true
+		} else {
+			reply.Succ = false
+		}
+	} else {
 
+	}
 }
 
 //
@@ -219,8 +247,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.Heartbeat", args, reply)
+func (rf *Raft) sendAppendEntries(server int, req *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	//	println("debug1909", args == nil, reply == nil)
+	ok := rf.peers[server].Call("Raft.AppendEntries", req, reply)
 	return ok
 }
 
@@ -294,18 +323,22 @@ func GetNowMilliTime() int64 {
 
 func (rf *Raft) electionTimeOutTimer() {
 	for {
+		//debug
+		//		println("打印当前超时时间：", rf.electionTimeoutMS)
 		time.Sleep(time.Duration(rf.electionTimeoutMS) * time.Millisecond)
-		if rf.nodeRole == LEADER {
+		if rf.getRaftRole() == LEADER {
 			continue
 		}
+		//debug
+		//		println(rf.me, "准备开始选举leader")
 		nowTime := GetNowMilliTime()
-		if int(nowTime-lastTime) > rf.electionTimeoutMS || rf.nodeRole == CANDIDATE {
+		if int(nowTime-rf.getLastLeaderHeartBeatTime()) > rf.electionTimeoutMS || rf.getRaftRole() == CANDIDATE {
 			go rf.startElection()
 		}
 	}
 }
 
-//Q leader在什么情况下，会退化为follower
+//Q leader在什么情况下，会退化为follower。也就是维持leader地位的协程何时停止
 //A
 func (rf *Raft) maintainLeader() {
 	for {
@@ -313,20 +346,19 @@ func (rf *Raft) maintainLeader() {
 		req := &AppendEntriesArgs{}
 		reply := &AppendEntriesReply{}
 
-		req.leaderCommit = rf.commitIndex
-		req.term = rf.currentTerm
-		req.leaderId = rf.me
-
-		for index, peer := range rf.peers {
+		req.LeaderCommit = rf.commitIndex
+		req.Term = rf.getRaftTerm()
+		req.LeaderId = rf.me
+		for index := range rf.peers {
 			if index == rf.me {
 				continue
 			}
-			result := rf.sendHeartbeat(index, req, reply)
+			result := rf.sendAppendEntries(index, req, reply)
 			if result {
-				if !reply.succ {
-					if reply.term > rf.currentTerm {
-						rf.currentTerm = reply.term
-						rf.becomeFollwer()
+				if !reply.Succ {
+					if reply.Term > rf.getRaftTerm() {
+						rf.setRaftTerm(reply.Term)
+						rf.setRaftRole(FOLLOWER)
 						return
 					}
 				}
@@ -338,15 +370,30 @@ func (rf *Raft) maintainLeader() {
 }
 
 func (rf *Raft) initParam() {
-	rf.currentTerm = 0
+	rf.setRaftTerm(0)
 	rf.commitIndex = 0
-	rf.nodeRole = FOLLOWER
+	rf.setRaftRole(FOLLOWER)
 	rf.setElectionTimeOut()
 	rf.raftHeartBeatIntervalMilli = 50
+	rf.setLastLeaderHeartBeatTime()
+	rf.entries = make([]LogEntry, 10)
+}
+
+func (rf *Raft) setLastLeaderHeartBeatTime() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.lastLeaderHeartBeatTime = GetNowMilliTime()
 }
 
+func (rf *Raft) getLastLeaderHeartBeatTime() int64 {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.lastLeaderHeartBeatTime
+}
+
 func (rf *Raft) setElectionTimeOut() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.electionTimeoutMS = produceElectionTimeoutParam()
 }
 
@@ -360,23 +407,50 @@ func RandInt(start, end int) int {
 	return n + start
 }
 
+func (rf *Raft) setRaftLeaderId(leaderId int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.leaderId = leaderId
+}
+
+func (rf *Raft) getRaftLeaderId() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.leaderId
+}
+
+func (rf *Raft) getRaftTerm() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm
+}
+
+func (rf *Raft) setRaftTerm(term int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.currentTerm = term
+}
+
 func (rf *Raft) startElection() {
-	if rf.nodeRole != CANDIDATE {
-		rf.nodeRole = CANDIDATE
+	if rf.getRaftRole() != CANDIDATE {
+		rf.setRaftRole(CANDIDATE)
 	}
-	rf.leaderId = -1
+	rf.setRaftLeaderId(-1)
 	succ := 0
 	majority := (len(rf.peers) + 1) / 2
-	rf.currentTerm++
+	rf.setRaftTerm(rf.getRaftTerm())
 	rf.setElectionTimeOut()
-	voteResult = make(chan map[int]int)
-	for index, peer := range rf.peers {
+	n := len(rf.peers)
+	count := 0
+	voteResult := make(chan int, n)
+	for index := range rf.peers {
 		if index == rf.me {
+			voteResult <- 1
 			continue
 		}
 		go func() {
 			voteArgs := &RequestVoteArgs{}
-			voteArgs.Term = rf.currentTerm
+			voteArgs.Term = rf.getRaftTerm()
 			voteArgs.CandidateId = rf.me
 			voteArgs.LastLogIndex = 0
 			voteArgs.LastLogTerm = 0
@@ -386,33 +460,38 @@ func (rf *Raft) startElection() {
 			result := rf.sendRequestVote(index, voteArgs, voteReply)
 			if result {
 				if voteReply.VoteGranted {
-					voteResult[index] <- 1
+					voteResult <- 1
 				} else {
-					if voteReply.Term > rf.currentTerm {
-						rf.currentTerm = voteReply.Term
-						voteResult[index] <- 0
+					if voteReply.Term > rf.getRaftTerm() {
+						rf.setRaftTerm(voteReply.Term)
+						voteResult <- 0
 					}
 				}
 			} else {
 				println("尝试连接server %d时，网络连接异常", index)
-				voteResult[index] <- 2
+				voteResult <- 2
 			}
 		}()
 
 	}
-	for key, value := range voteResult {
-		if value == 1 {
+	for a := range voteResult {
+		count++
+		if a == 1 {
 			succ++
 		}
+		if count == n {
+			break
+		}
 	}
+
 	//Q:如何判定在收集候选者期间，已经有leader联系自己了
 	//A:为当前raft设计一个leaderId，代表当前raft承认的leader
-	if rf.leaderId > 0 {
-		rf.nodeRole = FOLLOWER
+	if rf.getRaftLeaderId() > 0 {
+		rf.setRaftRole(LEADER)
 	} else if succ >= majority {
-		rf.nodeRole = LEADER
+		rf.setRaftRole(LEADER)
 		go rf.maintainLeader()
 	} else {
-		rf.nodeRole = CANDIDATE
+		rf.setRaftRole(CANDIDATE)
 	}
 }
