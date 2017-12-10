@@ -69,6 +69,7 @@ type AppendEntriesReply struct {
 //
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	voteLock  sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -169,11 +170,14 @@ type RequestVoteReply struct {
 
 //
 // example RequestVote RPC handler.
+// 该操作必须是一个原子操作
 //
 func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.voteLock.Lock()
+	defer rf.voteLock.Unlock()
 	reply.Term = rf.getRaftTerm()
-	if req.Term < rf.getRaftTerm() {
+	if req.Term < rf.getRaftTerm() || rf.getRaftLeaderId() >= 0 {
 		reply.VoteGranted = false
 		return
 	}
@@ -185,8 +189,9 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if lastEntry.Term == req.LastLogTerm {
 		if rf.commitIndex <= req.LastLogIndex {
 			rf.setRaftRole(FOLLOWER)
-			//			println(rf.me, "投票赞成", req.CandidateId)
+			println(rf.me, "投票赞成", req.CandidateId)
 			rf.setRaftLeaderId(req.CandidateId)
+			rf.setLastLeaderHeartBeatTime()
 			reply.VoteGranted = true
 			rf.setRaftTerm(req.Term)
 		} else {
@@ -197,6 +202,7 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.setRaftLeaderId(req.CandidateId)
 		reply.VoteGranted = true
 		rf.setRaftTerm(req.Term)
+		rf.setLastLeaderHeartBeatTime() //在投票时也需要更新心跳时间
 	}
 
 }
@@ -204,6 +210,7 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if len(req.Entries) == 0 {
 		if rf.getRaftTerm() <= req.Term {
+			rf.becomeFollower(req.LeaderId)
 			rf.setLastLeaderHeartBeatTime()
 			reply.Succ = true
 		} else {
@@ -331,10 +338,9 @@ func (rf *Raft) electionTimeOutTimer() {
 		if rf.getRaftRole() == LEADER {
 			continue
 		}
-		//debug
-		//		println(rf.me, "准备开始选举leader,leaderId=", rf.getRaftLeaderId(), "role=", rf.getRaftRole())
 		nowTime := GetNowMilliTime()
 		if int(nowTime-rf.getLastLeaderHeartBeatTime()) > rf.electionTimeoutMS || rf.getRaftRole() == CANDIDATE {
+			println(rf.me, "准备开始选举leader,leaderId=", rf.getRaftLeaderId(), "role=", rf.getRaftRole(), "electimeout=", rf.electionTimeoutMS)
 			go rf.startElection()
 		}
 	}
@@ -350,13 +356,18 @@ func (rf *Raft) startElection() {
 	majority := (len(rf.peers) + 1) / 2
 	rf.setRaftTerm(rf.getRaftTerm())
 	rf.setElectionTimeOut()
+	rf.setRaftLeaderId(NONE)
 	n := len(rf.peers)
 	count := 0
 	voteResult := make(chan int, n)
 	for index := range rf.peers {
 		tmpIndex := index
 		if tmpIndex == rf.me {
-			voteResult <- 1
+			if rf.getRaftLeaderId() >= 0 {
+				voteResult <- 0
+			} else {
+				voteResult <- 1
+			}
 			continue
 		}
 		go func() {
@@ -397,15 +408,12 @@ func (rf *Raft) startElection() {
 	}
 	//	println("网络连接失败的个数：", networkError)
 	//Q:如何判定在收集候选者期间，已经有leader联系自己了
-	//A:为当前raft设计一个leaderId，代表当前raft承认的leader
-	if rf.getRaftLeaderId() > 0 {
-		rf.becomeFollower(rf.getRaftLeaderId())
-	} else if succ >= majority {
+	//A:不需要判定，获知真正leader的情况应该是心跳发起者，因为只有leader才有资格发起心跳
+	if succ >= majority {
 		rf.setRaftRole(LEADER)
-		println(rf.me, "赢得选举")
+		rf.setRaftLeaderId(rf.me)
+		println(rf.me, "赢得选举", rf.getRaftRole())
 		go rf.maintainLeader()
-	} else {
-		rf.setRaftRole(CANDIDATE)
 	}
 }
 
@@ -487,7 +495,7 @@ func (rf *Raft) maintainLeader() {
 func (rf *Raft) becomeFollower(leaderId int) {
 	rf.setRaftLeaderId(leaderId)
 	rf.setRaftRole(FOLLOWER)
-	rf.setElectionTimeOut()
+	//	rf.setElectionTimeOut()
 }
 
 func (rf *Raft) initParam() {
@@ -517,6 +525,7 @@ func (rf *Raft) setElectionTimeOut() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.electionTimeoutMS = produceElectionTimeoutParam()
+	//	println(rf.me, "生成的随机数为：", rf.electionTimeoutMS)
 }
 
 func produceElectionTimeoutParam() int {
@@ -524,6 +533,7 @@ func produceElectionTimeoutParam() int {
 }
 
 func RandInt(start, end int) int {
+	rand.Seed(time.Now().UnixNano())
 	cha := end - start
 	n := rand.Intn(cha)
 	return n + start

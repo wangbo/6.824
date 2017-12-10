@@ -37,7 +37,8 @@ func TestInitialElection2A(t *testing.T) {
 		fmt.Printf("warning: term changed even though there were no failures")
 	}
 	//	cfg.checkOneLeader()
-	time.Sleep(1 * time.Hour)
+	time.Sleep(10 * time.Second)
+	println("------------------------------------------------------------")
 	cfg.checkOneLeader()
 	fmt.Printf("  ... Passed\n")
 }
