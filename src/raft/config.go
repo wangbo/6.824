@@ -269,7 +269,7 @@ func (cfg *config) checkOneLeader() int {
 		time.Sleep(500 * time.Millisecond)
 		leaders := make(map[int][]int)
 		for i := 0; i < cfg.n; i++ {
-			println("index=", cfg.rafts[i].me, "-leaderId=", cfg.rafts[i].getRaftLeaderId(), "-role=", cfg.rafts[i].getRaftRole())
+			//			println("index=", cfg.rafts[i].me, "-leaderId=", cfg.rafts[i].getRaftLeaderId(), "-role=", cfg.rafts[i].getRaftRole())
 			if cfg.connected[i] {
 				if t, leader := cfg.rafts[i].GetState(); leader {
 					leaders[t] = append(leaders[t], i)
@@ -319,8 +319,26 @@ func (cfg *config) checkNoLeader() {
 			_, is_leader := cfg.rafts[i].GetState()
 			if is_leader {
 				cfg.t.Fatalf("expected no leader, but %v claims to be leader", i)
+				//				DPrintf("expected no leader, but %v claims to be leader-----------------------------------------------------", i)
 			}
 		}
+	}
+}
+
+func (cfg *config) checkNoLeader2() {
+	flag := false
+	for i := 0; i < cfg.n; i++ {
+		if cfg.connected[i] {
+			_, is_leader := cfg.rafts[i].GetState()
+			if is_leader {
+				//				cfg.t.Fatalf("expected no leader, but %v claims to be leader", i)
+				println("rf=", i, "isLeader=", is_leader)
+				flag = true
+			}
+		}
+	}
+	if flag {
+		cfg.t.Fatalf("expected no leader, but %v claims to be leader", -1)
 	}
 }
 

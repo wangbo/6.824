@@ -15,73 +15,94 @@ import "math/rand"
 import "sync/atomic"
 import "sync"
 
+//import "log"
+
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
-func TestInitialElection2A(t *testing.T) {
-	servers := 3
-	cfg := make_config(t, servers, false)
-	defer cfg.cleanup()
-
-	fmt.Printf("Test (2A): initial election ...\n")
-
-	// is a leader elected?
-	cfg.checkOneLeader()
-
-	// does the leader+term stay the same if there is no network failure?
-	term1 := cfg.checkTerms()
-	time.Sleep(2 * RaftElectionTimeout)
-	term2 := cfg.checkTerms()
-	if term1 != term2 {
-		fmt.Printf("warning: term changed even though there were no failures")
-	}
-	//	cfg.checkOneLeader()
-	time.Sleep(10 * time.Second)
-	println("------------------------------------------------------------")
-	cfg.checkOneLeader()
-	fmt.Printf("  ... Passed\n")
-}
-
-//func TestReElection2A(t *testing.T) {
+//func TestInitialElection2A(t *testing.T) {
 //	servers := 3
 //	cfg := make_config(t, servers, false)
 //	defer cfg.cleanup()
 
-//	fmt.Printf("Test (2A): election after network failure ...\n")
+//	fmt.Printf("Test (2A): initial election ...\n")
+//	//	time.Sleep(10 * time.Second)
+//	// is a leader elected?
+//	cfg.checkOneLeader()
 
-//	leader1 := cfg.checkOneLeader()
-
-//	// if the leader disconnects, a new one should be elected.
-//	println("即将中断的leader为", leader1)
-//	//	cfg.disconnect(leader1)
-//	time.Sleep(1 * time.Minute)
-//	//	result := cfg.rafts[0].sendRequestVote(1, &RequestVoteArgs{}, &RequestVoteReply{})
-//	//	println("vote result1", result)
+//	// does the leader+term stay the same if there is no network failure?
+//	term1 := cfg.checkTerms()
+//	time.Sleep(2 * RaftElectionTimeout)
+//	term2 := cfg.checkTerms()
+//	if term1 != term2 {
+//		fmt.Printf("warning: term changed even though there were no failures")
+//	}
 //	//	cfg.checkOneLeader()
-
-//	//	// if the old leader rejoins, that shouldn't
-//	//	// disturb the old leader.
-//	//	cfg.connect(leader1)
-//	//	leader2 := cfg.checkOneLeader()
-
-//	//	// if there's no quorum, no leader should
-//	//	// be elected.
-//	//	cfg.disconnect(leader2)
-//	//	cfg.disconnect((leader2 + 1) % servers)
-//	//	time.Sleep(2 * RaftElectionTimeout)
-//	//	cfg.checkNoLeader()
-
-//	//	// if a quorum arises, it should elect a leader.
-//	//	cfg.connect((leader2 + 1) % servers)
-//	//	cfg.checkOneLeader()
-
-//	//	// re-join of last node shouldn't prevent leader from existing.
-//	//	cfg.connect(leader2)
-//	//	cfg.checkOneLeader()
-
-//	//	fmt.Printf("  ... Passed\n")
+//	//	time.Sleep(10 * time.Second)
+//	//	println("------------------------------------------------------------")
+//	cfg.checkOneLeader()
+//	fmt.Printf("  ... Passed\n")
 //}
+
+func TestReElection2X(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test (2A): election after network failure ...\n")
+
+	leader1 := cfg.checkOneLeader()
+
+	// if the leader disconnects, a new one should be elected.
+	cfg.disconnect(leader1)
+	DPrintf("leader%d已离线", leader1)
+	time.Sleep(30 * time.Second)
+}
+
+func TestReElection2A(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false)
+	defer cfg.cleanup()
+
+	fmt.Printf("Test (2A): election after network failure ...\n")
+
+	leader1 := cfg.checkOneLeader()
+
+	// if the leader disconnects, a new one should be elected.
+	cfg.disconnect(leader1)
+	DPrintf("leader%d已离线", leader1)
+	cfg.checkOneLeader()
+
+	// if the old leader rejoins, that shouldn't
+	// disturb the old leader.
+	cfg.connect(leader1)
+	DPrintf("%d重新上线", leader1)
+	leader2 := cfg.checkOneLeader()
+
+	// if there's no quorum, no leader should
+	// be elected.
+	DPrintf("即将断开的server，%d,%d", leader2, (leader2+1)%servers)
+	cfg.disconnect(leader2)
+	cfg.disconnect((leader2 + 1) % servers)
+	time.Sleep(2 * RaftElectionTimeout)
+
+	cfg.checkNoLeader()
+
+	//if a quorum arises, it should elect a leader.
+	cfg.connect((leader2 + 1) % servers)
+	cfg.checkOneLeader()
+
+	//re-join of last node shouldn't prevent leader from existing.
+	cfg.connect(leader2)
+	DPrintf("所有失联节点重新上线，开始检查leader")
+	cfg.checkOneLeader()
+
+	fmt.Printf("  ... Passed\n")
+
+	//	time.Sleep(30 * time.Second)
+	//	println(leader2)
+}
 
 func TestBasicAgree2B(t *testing.T) {
 	servers := 5
