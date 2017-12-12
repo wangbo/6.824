@@ -87,7 +87,7 @@ type Raft struct {
 	raftHeartBeatIntervalMilli int   //raft心跳间隔，单位是毫秒，任务初始化时指定
 	entries                    []LogEntry
 	raftIsShutdown             bool //当前进程是否关闭
-	leaderId                   int  //当前raft节点认为的leader的id
+	votedFor                   int  //当前term投票给谁了
 	leaderHeartCheckerSwitch   bool //用于检测在leader心跳的开关
 }
 
@@ -170,20 +170,32 @@ type RequestVoteReply struct {
 	VoteGranted bool //投票的结果，如果成功了，那么就返回true
 }
 
-//
-// example RequestVote RPC handler.
-// 该操作必须是一个原子操作
-//
+/*
+example RequestVote RPC handler.
+选举操作只判断状态，不更新状态。状态的更新应该是在leader选举出来之后
+该方法的调用者只能是候选者，而接收者可以使任何人
+
+1,如果是leader接收到了该请求，如果发现更高的term，那么就退回follower
+2,如果是候选者接收到了，那么和leader做同样的处理
+*/
 func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.voteLock.Lock()
 	defer rf.voteLock.Unlock()
 	reply.Term = rf.getRaftTerm()
+	if rf.getRaftRole() == FOLLOWER {
+		rf.setLastLeaderHeartBeatTime()
+		rf.setElectionTimeOut()
+	}
 
+	if rf.getRaftTerm() > req.Term {
+		DPrintf("term=%d,role=%s,rf=%d 拒绝rf=%d的投票请求，因为req的term比较小,reqTerm=%d", rf.getRaftTerm(),
+			getRole(rf.getRaftRole()), rf.me, req.CandidateId, req.Term)
+	}
 	//当前的raft是有主的，那么必然要拒绝其他选举请求
-	if req.Term < rf.getRaftTerm() || rf.getRaftLeaderId() >= 0 {
-		DPrintf("term=%d,role=%s,rf=%d 拒绝了rf=%d的选举请求,rfLeaderId=%d,reqTerm=%d", rf.getRaftTerm(),
-			getRole(rf.getRaftRole()), rf.me, req.CandidateId, rf.getRaftLeaderId(), req.Term)
+	if rf.getVotedFor() >= 0 {
+		DPrintf("term=%d,role=%s,rf=%d 投过了票所以拒绝了rf=%d的选举请求,votedFor=%d,reqTerm=%d", rf.getRaftTerm(),
+			getRole(rf.getRaftRole()), rf.me, req.CandidateId, rf.getVotedFor(), req.Term)
 		reply.VoteGranted = false
 		return
 	}
@@ -194,25 +206,28 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	} else if lastEntry.Term == req.LastLogTerm {
 		if rf.commitIndex <= req.LastLogIndex {
-			rf.setRaftRole(FOLLOWER)
-			rf.setRaftLeaderId(req.CandidateId)
-			rf.setLastLeaderHeartBeatTime()
+			if (rf.getRaftRole() == LEADER || rf.getRaftRole() == CANDIDATE) && req.Term > rf.getRaftTerm() {
+				rf.becomeFollower(NONE)
+				rf.setLastLeaderHeartBeatTime()
+				rf.setElectionTimeOut()
+			}
 			reply.VoteGranted = true
-			rf.setRaftTerm(req.Term)
-			DPrintf("term=%d,role=%s,rf=%d同意了rf=%d的选举请求", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.CandidateId)
+			rf.setVotedFor(req.CandidateId)
+			DPrintf("term=%d,role=%s,votedFor=%d,rf=%d同意了rf=%d的选举请求", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.getVotedFor(), rf.me, req.CandidateId)
 		} else {
 			reply.VoteGranted = false
-			DPrintf("term=%d,role=%s,rf=%d拒绝了rf=%d的选举请求", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.CandidateId)
+			DPrintf("term=%d,role=%s,votedFor=%d,rf=%d拒绝了rf=%d的选举请求,req的日志长度比较小", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.getVotedFor(), rf.me, req.CandidateId)
 		}
-	} else {
-		rf.setRaftRole(FOLLOWER)
-		rf.setRaftLeaderId(req.CandidateId)
+	} else { //当前的日志term要比请求的小
+		if (rf.getRaftRole() == LEADER || rf.getRaftRole() == CANDIDATE) && req.Term > rf.getRaftTerm() {
+			rf.becomeFollower(NONE)
+			rf.setLastLeaderHeartBeatTime()
+			rf.setElectionTimeOut()
+		}
 		reply.VoteGranted = true
-		rf.setRaftTerm(req.Term)
-		rf.setLastLeaderHeartBeatTime() //在投票时也需要更新心跳时间
-		DPrintf("term2=%d,role=%s,rf=%d拒绝了rf=%d的选举请求", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.CandidateId)
+		rf.setVotedFor(req.CandidateId)
+		DPrintf("term2=%d,role=%s,rf=%d同意rf=%d的选举请求,req的日志term比较大", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.CandidateId)
 	}
-
 }
 
 func (rf *Raft) setSwitchLeaderHeartbeatChecker(val bool) {
@@ -227,20 +242,31 @@ func (rf *Raft) getSwitchLeaderHeartbeatCheckerFlag() bool {
 	return rf.leaderHeartCheckerSwitch
 }
 
+/*
+该方法的发起者只可能是leader，或者说，自认为的leader
+Q:如果是leader接收到了心跳如何处理
+A:如果请求的term比自己大，那么就退回follower状态
+
+Q:候选者接收到了心跳如何处理
+A:接收到了leader的心跳，那么直接退回follower
+*/
 func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if len(req.Entries) == 0 {
+	if len(req.Entries) == 0 { //是心跳操作
+		if rf.getRaftRole() == CANDIDATE {
+			rf.setRaftRole(FOLLOWER)
+		}
 		if rf.getRaftTerm() <= req.Term {
 			DPrintf("term=%d,role=%s,rf=%d确认来自rf=%d的心跳请求,reqTerm=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.Me, req.Term)
-			if rf.me != req.Me {
-				if rf.getRaftRole() == LEADER {
-					DPrintf("term=%d,role=%s,rf=%d 由leader退化为follower", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
-				}
-				rf.becomeFollower(req.LeaderId)
+			//leader发现了更大的term
+			if rf.getRaftRole() == LEADER && rf.getRaftTerm() < req.Term {
+				rf.becomeFollower(NONE)
+				DPrintf("term=%d,role=%s,rf=%d 由leader退化为follower", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
 			}
 			rf.setLastLeaderHeartBeatTime()
 			rf.setRaftTerm(req.Term)
 			reply.Succ = true
-			if !rf.getSwitchLeaderHeartbeatCheckerFlag() && rf.me != req.Me {
+			rf.setVotedFor(req.Me)
+			if !rf.getSwitchLeaderHeartbeatCheckerFlag() {
 				rf.setSwitchLeaderHeartbeatChecker(true)
 				go rf.leaderHeartbeatChecker()
 			}
@@ -249,7 +275,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply)
 			reply.Term = rf.getRaftTerm()
 			DPrintf("term=%d,role=%s,rf=%d拒绝来自rf=%d的心跳请求,reqTerm=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.Me, req.Term)
 		}
-	} else {
+	} else { //日志追加操作
 
 	}
 }
@@ -271,26 +297,20 @@ func (rf *Raft) leaderHeartbeatChecker() {
 	for {
 		time.Sleep(time.Duration(rf.raftHeartBeatIntervalMilli) * time.Millisecond)
 		timeElapse := GetNowMilliTime() - rf.getLastLeaderHeartBeatTime()
-		if rf.getRaftRole() != LEADER {
-			//			DPrintf("term=%d,rf=%d,timeElapse=%d心跳超时检查,", rf.getRaftTerm(), rf.me, timeElapse)
-			if int(timeElapse) > rf.raftHeartBeatIntervalMilli {
-				//				if timeElapse < 150 {
-				DPrintf("term=%d,role=%s,rf=%d leader=%d的心跳超时未连接,重置归属,timeEla=%d,hbintevl=%d",
-					rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, rf.getRaftLeaderId(), timeElapse, rf.raftHeartBeatIntervalMilli)
-				//				}
-				rf.setRaftLeaderId(NONE)
-				rf.setElectionTimeOut()
-				rf.setLastLeaderHeartBeatTime()
-				rf.setSwitchLeaderHeartbeatChecker(false)
-				return
-			} else {
-				//				DPrintf("term=%d,role=%s,rf=%d,timeEla=%d，未出现心跳超时的情况", rf.getRaftTerm(), rf.me, timeElapse)
+		if int(timeElapse) > rf.raftHeartBeatIntervalMilli {
+			if !(timeElapse > 200) {
+				DPrintf("term=%d,role=%s,rf=%d votedFor=%d的心跳超时未连接,重置归属,timeEla=%d,hbintevl=%d",
+					rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, rf.getVotedFor(), timeElapse, rf.raftHeartBeatIntervalMilli)
 			}
+			rf.setVotedFor(NONE)
+			//			rf.setElectionTimeOut()
+			//			rf.setLastLeaderHeartBeatTime()
+			//			rf.setSwitchLeaderHeartbeatChecker(false)
+			//			return
 		} else {
-			return
+			//				DPrintf("term=%d,role=%s,rf=%d,timeEla=%d，未出现心跳超时的情况", rf.getRaftTerm(), rf.me, timeElapse)
 		}
 	}
-
 }
 
 //
@@ -414,6 +434,9 @@ func (rf *Raft) electionTimeOutTimer() {
 	}
 }
 
+/*
+该方法只能是候选者发起，如果检测到了更大的term，那么就返回到follower状态
+*/
 func (rf *Raft) startElection() {
 	if rf.getRaftRole() != CANDIDATE {
 		rf.setRaftRole(CANDIDATE)
@@ -422,11 +445,11 @@ func (rf *Raft) startElection() {
 	majority := (len(rf.peers) + 1) / 2
 	rf.setRaftTerm(rf.getRaftTerm() + 1)
 	rf.setElectionTimeOut()
-	rf.setRaftLeaderId(NONE)
+	rf.setVotedFor(NONE)
 	n := len(rf.peers)
 	count := 0
 	voteResult := make(chan *RequestVoteReply, n)
-	DPrintf("term=%d,role=%s,rf=%d发起了一次选举,timeOut=%d,leaderId=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, rf.getElectionTimeOut(), rf.getRaftLeaderId())
+	DPrintf("term=%d,role=%s,rf=%d发起了一次选举,timeOut=%d,votedFor=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, rf.getElectionTimeOut(), rf.getVotedFor())
 	for index := range rf.peers {
 		tmpIndex := index
 		go func() {
@@ -445,14 +468,18 @@ func (rf *Raft) startElection() {
 		}()
 
 	}
-	//如果所有节点都连不上网，那么就恢复当前的term
+	//如果所有节点都连不上网，那么就恢复当前的term?
 	networkError := 0
+	biggerTermFlag := false
 	for reply := range voteResult {
 		count++
 		if reply == nil {
 			networkError++
 		} else if reply.VoteGranted {
 			succ++
+		}
+		if reply != nil && reply.Term > rf.getRaftTerm() {
+			biggerTermFlag = true
 		}
 		if count == n || succ >= majority || networkError >= majority {
 			break
@@ -463,21 +490,30 @@ func (rf *Raft) startElection() {
 	//A:存在leader的情况下，选举必然失败，那么可以通过leader的心跳感知，然后退回follower
 	if succ >= majority {
 		rf.setRaftRole(LEADER)
-		rf.setRaftLeaderId(rf.me)
+		rf.setVotedFor(rf.me)
 		DPrintf("term=%d,role=%s,rf=%d 成为leader", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
 		go rf.maintainLeader()
 	} else {
-		DPrintf("term=%d,role=%s,rf=%d 竞选leader失败,succ=%d,networkError=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError)
+		if biggerTermFlag {
+			DPrintf("term=%d,role=%s,rf=%d 候选者检测到了更高的term，退化为follower")
+			rf.setRaftRole(FOLLOWER)
+			rf.setVotedFor(NONE)
+			rf.setLastLeaderHeartBeatTime()
+			rf.setElectionTimeOut()
+		} else {
+			//			rf.setVotedFor(NONE)
+			DPrintf("term=%d,role=%s,rf=%d 竞选leader失败,succ=%d,networkError=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError)
+		}
 	}
 
 }
 
 //Q leader在什么情况下，会退化为follower。也就是维持leader地位的协程何时停止
-//A 发现term比自己大的时候
+//A 发送心跳发现有比自己term更高的时候；有人向leader发起投票请求，然后leader感知到了更高的term；有leader给自己发送心跳请求的时候
 func (rf *Raft) maintainLeader() {
 	for {
-		if rf.getRaftRole() == FOLLOWER {
-			DPrintf("term=%d,rf=%d 监测到当前角色为FOLLOWER，退出leader心跳循环", rf.getRaftTerm(), rf.me)
+		if rf.getRaftRole() != LEADER {
+			DPrintf("term=%d,rf=%d 监测到当前角色为已经不是leader，退出leader心跳循环", rf.getRaftTerm(), rf.me)
 			return
 		}
 		req := &AppendEntriesArgs{}
@@ -488,6 +524,7 @@ func (rf *Raft) maintainLeader() {
 		req.LeaderId = rf.me
 		req.Me = rf.me
 
+		currentTerm := req.Term
 		n := len(rf.peers)
 		//		majority := (len(rf.peers) + 1) / 2
 		chnResult := make(chan *AppendEntriesReply, n)
@@ -534,20 +571,20 @@ func (rf *Raft) maintainLeader() {
 			}
 		}
 		if biggerTermFlag {
+			DPrintf("term=%d,role=%d,rf=%d 检测到了更大的term，由leader退回follower，发起心跳时的term=%d", rf.getRaftTerm(), rf.getRaftRole(), rf.me, currentTerm)
 			rf.becomeFollower(NONE)
 			rf.setElectionTimeOut()
 			rf.setLastLeaderHeartBeatTime()
-			DPrintf("term=%d,role=%d,rf=%d 检测到了更大的term，由leader退回follower", rf.getRaftTerm(), rf.getRaftRole(), rf.me)
 			return
 		}
 		if networkError == n {
 			rf.becomeFollower(NONE)
 			rf.setElectionTimeOut()
 			rf.setLastLeaderHeartBeatTime()
-			DPrintf("term=%d,role=%d,rf=%d 当前节点失联，由leader退回follower,耗时=%d", rf.getRaftTerm(), rf.getRaftRole(), rf.me, GetNowMilliTime()-begin)
+			DPrintf("term=%d,role=%d,rf=%d 当前节点失联，由leader退回follower,耗时=%d，失联时的term为=%d", rf.getRaftTerm(), rf.getRaftRole(), rf.me, GetNowMilliTime()-begin, currentTerm)
 			return
 		}
-		DPrintf("term=%d,role=%s,rf=%d leader心跳已完成,succ=%d,networkError=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError)
+		DPrintf("term=%d,role=%s,rf=%d leader心跳已完成,succ=%d,networkError=%d，发起心跳时的term=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError, currentTerm)
 		//		if succ < majority {
 		//			DPrintf("term=%d rf=%d 退化成为Follower", rf.getRaftTerm(), rf.me)
 		//			rf.becomeFollower(NONE)
@@ -563,8 +600,8 @@ func (rf *Raft) maintainLeader() {
 
 //candidate -> follower
 //leader -> follower
-func (rf *Raft) becomeFollower(leaderId int) {
-	rf.setRaftLeaderId(leaderId)
+func (rf *Raft) becomeFollower(candidateId int) {
+	rf.setVotedFor(candidateId)
 	rf.setRaftRole(FOLLOWER)
 	//	rf.setElectionTimeOut()
 }
@@ -574,7 +611,7 @@ func (rf *Raft) initParam() {
 	rf.commitIndex = 0
 	rf.setRaftRole(FOLLOWER)
 	rf.setElectionTimeOut()
-	rf.setRaftLeaderId(NONE)
+	rf.setVotedFor(NONE)
 	rf.raftHeartBeatIntervalMilli = 100
 	rf.setLastLeaderHeartBeatTime()
 	rf.entries = make([]LogEntry, 10)
@@ -616,16 +653,16 @@ func RandInt(start, end int) int {
 	return n + start
 }
 
-func (rf *Raft) setRaftLeaderId(leaderId int) {
+func (rf *Raft) setVotedFor(votedFor int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.leaderId = leaderId
+	rf.votedFor = votedFor
 }
 
-func (rf *Raft) getRaftLeaderId() int {
+func (rf *Raft) getVotedFor() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.leaderId
+	return rf.votedFor
 }
 
 func (rf *Raft) getRaftTerm() int {

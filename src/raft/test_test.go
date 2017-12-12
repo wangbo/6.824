@@ -90,6 +90,7 @@ func TestReElection2A(t *testing.T) {
 	cfg.checkNoLeader()
 
 	//if a quorum arises, it should elect a leader.
+	DPrintf("添加一个配额%d，应该可以选出leader", (leader2+1)%servers)
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
 
