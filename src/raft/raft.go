@@ -452,6 +452,7 @@ func (rf *Raft) startElection() {
 	n := len(rf.peers)
 	count := 0
 	voteResult := make(chan *RequestVoteReply, n)
+	beginTime := GetNowMilliTime()
 	DPrintf("term=%d,role=%s,rf=%d发起了一次选举,timeOut=%d,votedFor=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, rf.getElectionTimeOut(), rf.getVotedFor())
 	for index := range rf.peers {
 		tmpIndex := index
@@ -489,24 +490,26 @@ func (rf *Raft) startElection() {
 			break
 		}
 	}
-	DPrintf("term=%d,role=%s,rf=%d 选举结果收集succ=%d,networkError=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError)
+	costTime := GetNowMilliTime() - beginTime
+	DPrintf("term=%d,role=%s,rf=%d 选举结果收集succ=%d,networkError=%d,耗时：%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError, costTime)
 	//Q:如何判定在收集候选者期间，已经有leader联系自己了
 	//A:存在leader的情况下，选举必然失败，那么可以通过leader的心跳感知，然后退回follower
 	if succ >= majority {
 		rf.setRaftRole(LEADER)
 		rf.setVotedFor(rf.me)
-		DPrintf("term=%d,role=%s,rf=%d 成为leader", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
+		DPrintf("term=%d,role=%s,rf=%d 成为leader,耗时%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, costTime)
 		go rf.maintainLeader()
 	} else {
 		if biggerTermFlag {
-			DPrintf("term=%d,role=%s,rf=%d 候选者检测到了更高的term，退化为follower")
+			DPrintf("term=%d,role=%s,rf=%d 候选者检测到了更高的term，退化为follower，耗时%d", rf.getRaftTerm(), getRole(rf.getRaftRole()),
+				rf.getRaftTerm(), costTime)
 			rf.setRaftRole(FOLLOWER)
 			rf.setVotedFor(NONE)
 			rf.setLastLeaderHeartBeatTime()
 			rf.setElectionTimeOut()
 		} else {
 			//			rf.setVotedFor(NONE)
-			DPrintf("term=%d,role=%s,rf=%d 竞选leader失败,succ=%d,networkError=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError)
+			DPrintf("term=%d,role=%s,rf=%d 竞选leader失败,succ=%d,networkError=%d,耗时%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError, costTime)
 		}
 	}
 
@@ -604,7 +607,7 @@ func (rf *Raft) maintainLeader() {
 			rf.becomeFollower(NONE)
 			rf.setElectionTimeOut()
 			rf.setLastLeaderHeartBeatTime()
-			DPrintf("term=%d,role=%d,rf=%d 当前节点网络超时，由leader退回follower,耗时=%d，失联时的term为=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, GetNowMilliTime()-begin, currentTerm)
+			DPrintf("term=%d,role=%s,rf=%d 当前节点网络超时，由leader退回follower,耗时=%d，失联时的term为=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, GetNowMilliTime()-begin, currentTerm)
 			return
 		}
 		DPrintf("term=%d,role=%s,rf=%d leader心跳已完成,succ=%d,networkError=%d，发起心跳时的term=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError, currentTerm)
