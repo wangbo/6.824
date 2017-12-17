@@ -89,6 +89,9 @@ type Raft struct {
 	raftIsShutdown             bool //当前进程是否关闭
 	votedFor                   int  //当前term投票给谁了
 	leaderHeartCheckerSwitch   bool //用于检测在leader心跳的开关
+
+	//	raftIsShutdown     bool       //是否退出当前raft
+	raftIsShutdownLock sync.Mutex //是否关闭的lock
 }
 
 // return currentTerm and whether this server
@@ -103,6 +106,18 @@ func (rf *Raft) GetState() (int, bool) {
 	}
 	term = rf.getRaftTerm()
 	return term, isleader
+}
+
+func (rf *Raft) setRaftIsShutdown(lock bool) {
+	rf.raftIsShutdownLock.Lock()
+	defer rf.raftIsShutdownLock.Unlock()
+	rf.raftIsShutdown = lock
+}
+
+func (rf *Raft) getRaftIsShutdown() bool {
+	rf.raftIsShutdownLock.Lock()
+	defer rf.raftIsShutdownLock.Unlock()
+	return rf.raftIsShutdown
 }
 
 func (rf *Raft) setRaftRole(role int) {
@@ -297,7 +312,7 @@ func getRole(i int) string {
 }
 
 func (rf *Raft) leaderHeartbeatChecker() {
-	for {
+	for !rf.getRaftIsShutdown() {
 		time.Sleep(time.Duration(rf.raftHeartBeatIntervalMilli) * time.Millisecond)
 		timeElapse := GetNowMilliTime() - rf.getLastLeaderHeartBeatTime()
 		if int(timeElapse) > rf.raftHeartBeatIntervalMilli {
@@ -306,10 +321,6 @@ func (rf *Raft) leaderHeartbeatChecker() {
 					rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, rf.getVotedFor(), timeElapse, rf.raftHeartBeatIntervalMilli)
 			}
 			rf.setVotedFor(NONE)
-			//			rf.setElectionTimeOut()
-			//			rf.setLastLeaderHeartBeatTime()
-			//			rf.setSwitchLeaderHeartbeatChecker(false)
-			//			return
 		} else {
 			//				DPrintf("term=%d,role=%s,rf=%d,timeEla=%d，未出现心跳超时的情况", rf.getRaftTerm(), rf.me, timeElapse)
 		}
@@ -386,7 +397,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
-
+	rf.setRaftIsShutdown(true)
 }
 
 //
@@ -425,7 +436,7 @@ func GetNowMilliTime() int64 {
 }
 
 func (rf *Raft) electionTimeOutTimer() {
-	for {
+	for !rf.getRaftIsShutdown() {
 		time.Sleep(time.Duration(rf.getElectionTimeOut()) * time.Millisecond)
 		if rf.getRaftRole() == LEADER {
 			continue
@@ -435,6 +446,7 @@ func (rf *Raft) electionTimeOutTimer() {
 			rf.startElection()
 		}
 	}
+	DPrintf("term=%d,rf=%d,role=%d 执行关闭操作", rf.getRaftTerm(), rf.me, getRole(rf.getRaftRole()))
 }
 
 /*
@@ -472,7 +484,7 @@ func (rf *Raft) startElection() {
 		}()
 
 	}
-	//如果所有节点都连不上网，那么就恢复当前的term?
+
 	networkError := 0
 	biggerTermFlag := false
 	for reply := range voteResult {
@@ -518,7 +530,7 @@ func (rf *Raft) startElection() {
 //Q leader在什么情况下，会退化为follower。也就是维持leader地位的协程何时停止
 //A 发送心跳发现有比自己term更高的时候；有人向leader发起投票请求，然后leader感知到了更高的term；有leader给自己发送心跳请求的时候
 func (rf *Raft) maintainLeader() {
-	for {
+	for !rf.getRaftIsShutdown() {
 		if rf.getRaftRole() != LEADER {
 			DPrintf("term=%d,rf=%d 监测到当前角色为已经不是leader，退出leader心跳循环", rf.getRaftTerm(), rf.me)
 			return
@@ -533,18 +545,10 @@ func (rf *Raft) maintainLeader() {
 
 		currentTerm := req.Term
 		n := len(rf.peers)
-		//		majority := (len(rf.peers) + 1) / 2
 		chnResult := make(chan *AppendEntriesReply, n)
 		DPrintf("term=%d,role=%s,rf=%d 开始发送leader心跳", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
 		for index := range rf.peers {
 			tmpIndex := index
-			//			if tmpIndex == rf.me {
-			//				ry := &AppendEntriesReply{}
-			//				ry.Succ = true
-			//				chnResult <- ry //心跳成功
-			//				continue
-			//			}
-			//			tmp := index
 			go func() {
 				timeoutChn := make(chan int)
 				appendEntryResultChn := make(chan bool)
@@ -566,11 +570,6 @@ func (rf *Raft) maintainLeader() {
 				case <-timeoutChn:
 					chnResult <- nil
 				}
-				//				if result {
-				//					chnResult <- reply
-				//				} else {
-				//					chnResult <- nil //网络失败
-				//				}
 			}()
 
 		}
@@ -611,15 +610,6 @@ func (rf *Raft) maintainLeader() {
 			return
 		}
 		DPrintf("term=%d,role=%s,rf=%d leader心跳已完成,succ=%d,networkError=%d，发起心跳时的term=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError, currentTerm)
-		//		if succ < majority {
-		//			DPrintf("term=%d rf=%d 退化成为Follower", rf.getRaftTerm(), rf.me)
-		//			rf.becomeFollower(NONE)
-		//			return
-		//		}
-		//		if rf.getRaftRole() == FOLLOWER {
-		//			DPrintf("term=%d,rf=%d 监测到当前角色为FOLLOWER，退出leader心跳循环", rf.getRaftTerm(), rf.me)
-		//			return
-		//		}
 		time.Sleep(time.Duration(rf.raftHeartBeatIntervalMilli) * time.Millisecond)
 	}
 }
@@ -642,6 +632,7 @@ func (rf *Raft) initParam() {
 	rf.setLastLeaderHeartBeatTime()
 	rf.entries = make([]LogEntry, 10)
 	rf.leaderHeartCheckerSwitch = false
+	rf.setRaftIsShutdown(false)
 }
 
 func (rf *Raft) setLastLeaderHeartBeatTime() {

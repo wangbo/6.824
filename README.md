@@ -1,2 +1,1 @@
-# 6.824
-6.824 lab
+# [Raft](https://github.com/wangbo01/6.824/blob/master/src/raft/README.md)
