@@ -47,7 +47,7 @@ type ApplyMsg struct {
 type LogEntry struct {
 	Term    int
 	Index   int
-	Content interface{}
+	Command interface{}
 }
 
 type AppendEntriesArgs struct {
@@ -63,6 +63,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int //返回的term，用于leader更新自己
 	Succ bool
+	//	IsLogMatch bool //标记当前日志追加失败的操作是否为日志不匹配引起的
 }
 
 //
@@ -74,6 +75,7 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
+	applyCh   chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -85,13 +87,14 @@ type Raft struct {
 	commitIndex                int   //当前已提交的index
 	lastLeaderHeartBeatTime    int64 //上次心跳时，unix时间戳，单位是毫秒
 	raftHeartBeatIntervalMilli int   //raft心跳间隔，单位是毫秒，任务初始化时指定
-	entries                    []LogEntry
-	raftIsShutdown             bool //当前进程是否关闭
-	votedFor                   int  //当前term投票给谁了
-	leaderHeartCheckerSwitch   bool //用于检测在leader心跳的开关
+	raftIsShutdown             bool  //当前进程是否关闭
+	votedFor                   int   //当前term投票给谁了
+	leaderHeartCheckerSwitch   bool  //用于检测在leader心跳的开关
 
 	//	raftIsShutdown     bool       //是否退出当前raft
 	raftIsShutdownLock sync.Mutex //是否关闭的lock
+	logEntries         []LogEntry //保存接收到的日志
+	logEntryLock       sync.Mutex //同步日志时使用的锁
 }
 
 // return currentTerm and whether this server
@@ -221,7 +224,11 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	lastEntry := rf.entries[len(rf.entries)-1]
+	var lastEntry LogEntry
+	entryLen := len(rf.logEntries)
+	if entryLen != 0 {
+		lastEntry = rf.logEntries[len(rf.logEntries)-1]
+	}
 	if lastEntry.Term > req.LastLogTerm {
 		reply.VoteGranted = false
 		return
@@ -266,7 +273,7 @@ Q:候选者接收到了心跳如何处理
 A:接收到了leader的心跳，那么直接退回follower
 */
 func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply) {
-	reply.Term = req.Term
+	reply.Term = rf.getRaftTerm()
 	if len(req.Entries) == 0 { //是心跳操作
 		if rf.getRaftRole() == CANDIDATE {
 			rf.setRaftRole(FOLLOWER)
@@ -284,6 +291,15 @@ func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply)
 			rf.setLastLeaderHeartBeatTime()
 			rf.setRaftTerm(req.Term)
 			reply.Succ = true
+			//更新follower的提交日志
+			if req.LeaderCommit > rf.getLeaderCommitIndex() {
+				recvLastEntryIndex := len(rf.logEntries)
+				if recvLastEntryIndex < req.LeaderCommit { //取较小应该是为了不越界
+					rf.leaderUpdateCommitIndex(recvLastEntryIndex)
+				} else {
+					rf.leaderUpdateCommitIndex(req.LeaderCommit)
+				}
+			}
 			rf.setVotedFor(req.Me)
 			if !rf.getSwitchLeaderHeartbeatCheckerFlag() {
 				rf.setSwitchLeaderHeartbeatChecker(true)
@@ -294,7 +310,35 @@ func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply)
 			DPrintf("term=%d,role=%s,rf=%d拒绝来自rf=%d的心跳请求,reqTerm=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.Me, req.Term)
 		}
 	} else { //日志追加操作
+		rf.logEntryLock.Lock()
+		defer rf.logEntryLock.Unlock()
+		if req.Term < rf.getRaftTerm() {
+			reply.Succ = false
+			reply.Term = rf.getRaftTerm()
+			return
+		}
 
+		//日志匹配
+		probablyLogEntry := rf.logEntries[req.PrevLogIndex]
+		if probablyLogEntry.Term == req.PrevLogTerm {
+			//todo 修改为批量插入
+			newLogEntry := rf.getLogEntryByCommand(req.Entries[0])
+			rfPrevLogIndex := len(rf.logEntries) - 1
+			if req.PrevLogIndex != rfPrevLogIndex {
+				rf.logEntries = rf.logEntries[:req.PrevLogIndex+1]
+				BPrintf("term=%d,role=%s,rf=%d 删除冲突日志,cmd=%d,req.PreLogIndex=%d,len(rf.log)=%d,leader=%d",
+					rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, newLogEntry.Command.(int),
+					req.PrevLogIndex, rfPrevLogIndex, rf.votedFor)
+			}
+			rf.logEntries = append(rf.logEntries, newLogEntry)
+			reply.Succ = true
+			BPrintf("term=%d,role=%s,rf=%d 认同leader的日志追加操作,entry=%d",
+				rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, newLogEntry.Command.(int))
+		} else {
+			reply.Succ = false
+			BPrintf("term=%d,role=%s,rf=%d 指定位置的term不匹配，拒绝追加操作,cmd=", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me,
+				req.Entries[0].Command.(int))
+		}
 	}
 }
 
@@ -382,11 +426,111 @@ func (rf *Raft) sendAppendEntries(server int, req *AppendEntriesArgs, reply *App
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
 
 	// Your code here (2B).
-
+	rf.mu.Lock()
+	index = len(rf.logEntries)
+	term = rf.currentTerm
+	if rf.nodeRole == LEADER {
+		isLeader = true
+		go rf.leaderSendAppendEntries(command)
+	}
+	rf.mu.Unlock()
 	return index, term, isLeader
+}
+
+func (rf *Raft) getLogEntryByCommand(command interface{}) LogEntry {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	var logEntry LogEntry
+	logEntry.Command = command
+	logEntry.Index = len(rf.logEntries)
+	logEntry.Term = rf.currentTerm
+	return logEntry
+}
+
+func (rf *Raft) leaderUpdateCommitIndex(index int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.commitIndex = index
+}
+
+func (rf *Raft) getLeaderCommitIndex() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.commitIndex
+}
+
+//在leader的心跳中，更新已提交的commitIndex
+//生产环境应该需要添加重试机制
+func (rf *Raft) leaderSendAppendEntries(command interface{}) {
+	rf.logEntryLock.Lock()
+	preLogIndex := len(rf.logEntries) - 1 //追加新的entry之前的index的位置
+	preLogEntry := rf.logEntries[preLogIndex]
+	preLogTerm := preLogEntry.Term
+
+	newLogEntry := rf.getLogEntryByCommand(command)
+	rf.logEntries = append(rf.logEntries, newLogEntry)
+
+	//	begin := GetNowMilliTime()
+
+	//	BPrintf("term=%d role=%s rf=%d 开始追加日志，cmd=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, command)
+	appendEntryResult := make(chan *AppendEntriesReply, len(rf.peers)-1)
+	for i := range rf.peers {
+		tmpI := i
+		if tmpI != rf.me {
+			req := &AppendEntriesArgs{}
+			req.Term = rf.getRaftTerm()
+			req.LeaderId = rf.me
+			req.LeaderCommit = rf.commitIndex
+			req.PrevLogIndex = preLogIndex
+			req.PrevLogTerm = preLogTerm
+			req.Entries = append(req.Entries, newLogEntry)
+			reply := &AppendEntriesReply{}
+			go func() {
+				for !rf.getRaftIsShutdown() && rf.nodeRole == LEADER {
+					result := rf.sendAppendEntries(tmpI, req, reply)
+					if !result { //网络异常，重试
+						continue
+					}
+					//如果是term比较小的原因，那么leader就需要退回follower了
+					if reply.Term > rf.getRaftTerm() || reply.Succ == true {
+						//						BPrintf("term=%d role=%s rf =%d 请求%d追加日志的操作成功", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI)
+						appendEntryResult <- reply
+						return
+					} else if !reply.Succ { //如果不是因为term导致失败，那么一定是因为log不匹配
+						tmpEntry := rf.logEntries[preLogIndex-1] //回退一格日志
+						req.PrevLogIndex = preLogIndex - 1
+						req.PrevLogTerm = tmpEntry.Term
+						req.Term = rf.getRaftTerm()
+						req.Entries = rf.logEntries[req.PrevLogIndex:]
+						BPrintf("term=%d role=%s rf =%d prevLogIndex不匹配，回退一格", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
+					}
+				}
+			}()
+		}
+	}
+	succ := 1
+	major := (len(rf.peers) + 1) / 2
+	for reply := range appendEntryResult {
+		if reply.Succ == true {
+			succ++
+		} else if reply.Term > rf.getRaftTerm() {
+			rf.setRaftTerm(reply.Term)
+			rf.becomeFollower(NONE)
+			rf.setElectionTimeOut()
+			rf.setLastLeaderHeartBeatTime()
+			BPrintf("term=%d,role=%d,rf=%d 在追加日志的过程中，发现更高的term，退回follower", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
+		}
+		if succ >= major {
+			//			BPrintf("term=%d,role=%s,rf=%d 大多数的节点已经接收到日志，耗时=%d,succ=", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, (GetNowMilliTime() - begin), succ)
+			rf.leaderUpdateCommitIndex(rf.getLeaderCommitIndex() + 1)
+			break
+		}
+	}
+	//	BPrintf("term=%d,role=%s,rf=%d 完成日志追加操作，耗时=%d,succ=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, (GetNowMilliTime() - begin), succ)
+	rf.logEntryLock.Unlock()
 }
 
 //
@@ -417,6 +561,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	//初始化当前参数
@@ -630,9 +775,13 @@ func (rf *Raft) initParam() {
 	rf.setVotedFor(NONE)
 	rf.raftHeartBeatIntervalMilli = 100
 	rf.setLastLeaderHeartBeatTime()
-	rf.entries = make([]LogEntry, 10)
 	rf.leaderHeartCheckerSwitch = false
 	rf.setRaftIsShutdown(false)
+	var initEntry LogEntry
+	initEntry.Term = 0
+	initEntry.Index = 0
+	initEntry.Command = -9999
+	rf.logEntries = append(rf.logEntries, initEntry)
 }
 
 func (rf *Raft) setLastLeaderHeartBeatTime() {

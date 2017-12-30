@@ -408,10 +408,14 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 // returns index.
 func (cfg *config) one(cmd int, expectedServers int) int {
 	t0 := time.Now()
+	//	begin := GetNowMilliTime()
 	starts := 0
+	count := 0
+	//	totalIndex := -1
 	for time.Since(t0).Seconds() < 10 {
 		// try all the servers, maybe one is the leader.
 		index := -1
+		count++
 		for si := 0; si < cfg.n; si++ {
 			starts = (starts + 1) % cfg.n
 			var rf *Raft
@@ -423,6 +427,7 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 			if rf != nil {
 				index1, _, ok := rf.Start(cmd)
 				if ok {
+					//					cfg.t.Fatalf("one(%v) failed to reach agreement123 index=%d", cmd, index)
 					index = index1
 					break
 				}
@@ -441,9 +446,12 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 						// and it was the command we submitted.
 						return index
 					}
+
 				}
+				println("cmd=", cmd, "cmd2=", cmd1.(int), ",index=", index)
 				time.Sleep(20 * time.Millisecond)
 			}
+			//			cfg.t.Fatalf("one(%v) failed to reach agreement999 index=%d", cmd, index)
 		} else {
 			time.Sleep(50 * time.Millisecond)
 		}
