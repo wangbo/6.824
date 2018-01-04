@@ -125,6 +125,7 @@ func TestBasicAgree2B(t *testing.T) {
 			t.Fatalf("got index %v but expected %v", xindex, index)
 		}
 	}
+	//	time.Sleep(1 * time.Minute)
 	fmt.Printf("  ... Passed\n")
 }
 

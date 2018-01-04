@@ -85,6 +85,7 @@ type Raft struct {
 	nodeRole                   int   //当前节点的角色状态，默认为follower
 	currentTerm                int   //当前的term
 	commitIndex                int   //当前已提交的index
+	currentIndex               int   //已经提交到状态机的index
 	lastLeaderHeartBeatTime    int64 //上次心跳时，unix时间戳，单位是毫秒
 	raftHeartBeatIntervalMilli int   //raft心跳间隔，单位是毫秒，任务初始化时指定
 	raftIsShutdown             bool  //当前进程是否关闭
@@ -322,7 +323,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply)
 		probablyLogEntry := rf.logEntries[req.PrevLogIndex]
 		if probablyLogEntry.Term == req.PrevLogTerm {
 			//todo 修改为批量插入
-			newLogEntry := rf.getLogEntryByCommand(req.Entries[0])
+			newLogEntry := rf.getLogEntryByCommand(req.Entries[0].Command)
 			rfPrevLogIndex := len(rf.logEntries) - 1
 			if req.PrevLogIndex != rfPrevLogIndex {
 				rf.logEntries = rf.logEntries[:req.PrevLogIndex+1]
@@ -525,12 +526,21 @@ func (rf *Raft) leaderSendAppendEntries(command interface{}) {
 		}
 		if succ >= major {
 			//			BPrintf("term=%d,role=%s,rf=%d 大多数的节点已经接收到日志，耗时=%d,succ=", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, (GetNowMilliTime() - begin), succ)
+			rf.applyMsg2StateMachine(newLogEntry)
 			rf.leaderUpdateCommitIndex(rf.getLeaderCommitIndex() + 1)
 			break
 		}
 	}
 	//	BPrintf("term=%d,role=%s,rf=%d 完成日志追加操作，耗时=%d,succ=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, (GetNowMilliTime() - begin), succ)
 	rf.logEntryLock.Unlock()
+}
+
+//模拟提交到状态机的操作
+func (rf *Raft) applyMsg2StateMachine(entry LogEntry) {
+	var applyMsg ApplyMsg
+	applyMsg.Command = entry.Command
+	applyMsg.Index = entry.Index
+	rf.applyCh <- applyMsg
 }
 
 //
@@ -565,14 +575,34 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	//初始化当前参数
-	rf.initParam()
+	rf.initParam(applyCh)
 	//开始选举超时判定任务
 	go rf.electionTimeOutTimer()
+
+	//启动一个定时的任务，提交commited index之前的日志到状态机
+	go rf.applyCommittedMsg2StateMachine()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+
+func (rf *Raft) applyCommittedMsg2StateMachine() {
+	for !rf.getRaftIsShutdown() {
+		time.Sleep(time.Duration(5) * time.Millisecond)
+		//		rf.mu.Lock()
+		//		defer rf.mu.Unlock()
+		if rf.currentIndex == rf.commitIndex {
+			continue
+		}
+		toCommitArray := rf.logEntries[rf.currentIndex+1 : rf.commitIndex+1]
+		for i := 0; i < len(toCommitArray); i++ {
+			rf.applyMsg2StateMachine(toCommitArray[i])
+		}
+		rf.currentIndex = rf.commitIndex
+
+	}
 }
 
 //获取当前时间的毫秒数
@@ -767,9 +797,9 @@ func (rf *Raft) becomeFollower(candidateId int) {
 	//	rf.setElectionTimeOut()
 }
 
-func (rf *Raft) initParam() {
+func (rf *Raft) initParam(applyCh chan ApplyMsg) {
 	rf.setRaftTerm(0)
-	rf.commitIndex = 0
+
 	rf.setRaftRole(FOLLOWER)
 	rf.setElectionTimeOut()
 	rf.setVotedFor(NONE)
@@ -782,6 +812,13 @@ func (rf *Raft) initParam() {
 	initEntry.Index = 0
 	initEntry.Command = -9999
 	rf.logEntries = append(rf.logEntries, initEntry)
+	rf.currentIndex = -1
+	rf.commitIndex = 0
+
+	//	var applyMsg ApplyMsg
+	//	applyMsg.Index = 0
+	//	applyMsg.Command = -9999
+	//	applyCh <- applyMsg
 }
 
 func (rf *Raft) setLastLeaderHeartBeatTime() {
