@@ -96,6 +96,21 @@ type Raft struct {
 	raftIsShutdownLock sync.Mutex //是否关闭的lock
 	logEntries         []LogEntry //保存接收到的日志
 	logEntryLock       sync.Mutex //同步日志时使用的锁
+
+	nextIndexMap      map[int]int //下一个需要和leader同步的日志的index
+	nextIndexFlagMap  map[int]int //标志位，如果为1,则表示当前有协程在处理和follower的同步操作，如果为0则表示没有
+	nextIndexFlagLock sync.Mutex  //更新nextIndexFlagMap时需要保证线程安全
+}
+
+func (rf *Raft) initNextIndex() {
+	rf.logEntryLock.Lock()
+	defer rf.logEntryLock.Unlock()
+	rf.nextIndexMap = make(map[int]int)
+	rf.nextIndexFlagMap = make(map[int]int)
+	for i := range rf.peers {
+		rf.nextIndexMap[i] = len(rf.logEntries) - 1
+		rf.nextIndexFlagMap[i] = 0
+	}
 }
 
 // return currentTerm and whether this server
@@ -287,18 +302,18 @@ func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply)
 			//leader发现了更大的term
 			if rf.getRaftTerm() < req.Term && rf.getRaftRole() == LEADER {
 				rf.becomeFollower(NONE)
-				DPrintf("term=%d,role=%s,rf=%d 由leader退化为follower", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
+				BPrintf("term=%d,role=%s,rf=%d 由leader退化为follower", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
 			}
 			rf.setLastLeaderHeartBeatTime()
 			rf.setRaftTerm(req.Term)
 			reply.Succ = true
 			//更新follower的提交日志
-			if req.LeaderCommit > rf.getLeaderCommitIndex() {
+			if req.LeaderCommit > rf.getCommitIndex() {
 				recvLastEntryIndex := len(rf.logEntries)
 				if recvLastEntryIndex < req.LeaderCommit { //取较小应该是为了不越界
-					rf.leaderUpdateCommitIndex(recvLastEntryIndex)
+					rf.updateCommitIndex(recvLastEntryIndex)
 				} else {
-					rf.leaderUpdateCommitIndex(req.LeaderCommit)
+					rf.updateCommitIndex(req.LeaderCommit)
 				}
 			}
 			rf.setVotedFor(req.Me)
@@ -320,10 +335,17 @@ func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply)
 		}
 
 		//日志匹配
+		if len(rf.logEntries)-1 < req.PrevLogIndex {
+			BPrintf("term=%d,role=%s,rf=%d req.PrevLogIndex=%d > len(rf.logEntries)=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.PrevLogIndex, len(rf.logEntries)-1)
+			reply.Succ = false
+			return
+		}
+
 		probablyLogEntry := rf.logEntries[req.PrevLogIndex]
 		if probablyLogEntry.Term == req.PrevLogTerm {
 			//todo 修改为批量插入
-			newLogEntry := rf.getLogEntryByCommand(req.Entries[0].Command)
+			//			newLogEntry := rf.getLogEntryByCommand(req.Entries[0].Command)
+			newLogEntry := req.Entries[0]
 			rfPrevLogIndex := len(rf.logEntries) - 1
 			if req.PrevLogIndex != rfPrevLogIndex {
 				rf.logEntries = rf.logEntries[:req.PrevLogIndex+1]
@@ -333,8 +355,17 @@ func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply)
 			}
 			rf.logEntries = append(rf.logEntries, newLogEntry)
 			reply.Succ = true
-			BPrintf("term=%d,role=%s,rf=%d 认同leader的日志追加操作,entry=%d",
-				rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, newLogEntry.Command.(int))
+			rf.setLastLeaderHeartBeatTime()
+
+			recvLastEntryIndex := len(rf.logEntries)
+			if recvLastEntryIndex < req.LeaderCommit { //取较小应该是为了不越界
+				rf.updateCommitIndex(recvLastEntryIndex)
+			} else {
+				rf.updateCommitIndex(req.LeaderCommit)
+			}
+
+			BPrintf("term=%d,role=%s,rf=%d 认同leader的日志追加操作,cmd=%d,myentry.len=%d,entry_index=%d,commitIndex=%d",
+				rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, newLogEntry.Command.(int), len(rf.logEntries), newLogEntry.Index, rf.getCommitIndex())
 		} else {
 			reply.Succ = false
 			BPrintf("term=%d,role=%s,rf=%d 指定位置的term不匹配，拒绝追加操作,cmd=", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me,
@@ -362,7 +393,7 @@ func (rf *Raft) leaderHeartbeatChecker() {
 		timeElapse := GetNowMilliTime() - rf.getLastLeaderHeartBeatTime()
 		if int(timeElapse) > rf.raftHeartBeatIntervalMilli {
 			if !(timeElapse > 200) {
-				DPrintf("term=%d,role=%s,rf=%d votedFor=%d的心跳超时未连接,重置归属,timeEla=%d,hbintevl=%d",
+				BPrintf("term=%d,role=%s,rf=%d votedFor=%d的心跳超时未连接,重置归属,timeEla=%d,hbintevl=%d",
 					rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, rf.getVotedFor(), timeElapse, rf.raftHeartBeatIntervalMilli)
 			}
 			rf.setVotedFor(NONE)
@@ -431,13 +462,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index = len(rf.logEntries)
 	term = rf.currentTerm
 	if rf.nodeRole == LEADER {
+		//		BPrintf("找打了leader,%d,role=%s", rf.me, getRole(rf.nodeRole))
 		isLeader = true
 		go rf.leaderSendAppendEntries(command)
 	}
-	rf.mu.Unlock()
 	return index, term, isLeader
 }
 
@@ -451,25 +483,53 @@ func (rf *Raft) getLogEntryByCommand(command interface{}) LogEntry {
 	return logEntry
 }
 
-func (rf *Raft) leaderUpdateCommitIndex(index int) {
+func (rf *Raft) updateCommitIndex(index int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.commitIndex = index
 }
 
-func (rf *Raft) getLeaderCommitIndex() int {
+func (rf *Raft) getCommitIndex() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.commitIndex
+}
+
+func chanIsClosed(ch <-chan *AppendEntriesReply) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+	}
+
+	return false
+}
+
+func (rf *Raft) lockFollowerAppendEntry(tmpI int) bool {
+	rf.nextIndexFlagLock.Lock()
+	defer rf.nextIndexFlagLock.Unlock()
+	if rf.nextIndexFlagMap[tmpI] == 0 {
+		rf.nextIndexFlagMap[tmpI] = 1
+		return true
+	} else {
+		return false
+	}
+}
+
+func (rf *Raft) unlockFollowerAppendEntry(tmpI int) {
+	rf.nextIndexFlagLock.Lock()
+	defer rf.nextIndexFlagLock.Unlock()
+	rf.nextIndexFlagMap[tmpI] = 0
 }
 
 //在leader的心跳中，更新已提交的commitIndex
 //生产环境应该需要添加重试机制
 func (rf *Raft) leaderSendAppendEntries(command interface{}) {
 	rf.logEntryLock.Lock()
-	preLogIndex := len(rf.logEntries) - 1 //追加新的entry之前的index的位置
-	preLogEntry := rf.logEntries[preLogIndex]
-	preLogTerm := preLogEntry.Term
+	defer rf.logEntryLock.Unlock()
+	//	preLogIndex := len(rf.logEntries) - 1 //追加新的entry之前的index的位置
+	//	preLogEntry := rf.logEntries[preLogIndex]
+	//	preLogTerm := preLogEntry.Term
 
 	newLogEntry := rf.getLogEntryByCommand(command)
 	rf.logEntries = append(rf.logEntries, newLogEntry)
@@ -481,34 +541,50 @@ func (rf *Raft) leaderSendAppendEntries(command interface{}) {
 	for i := range rf.peers {
 		tmpI := i
 		if tmpI != rf.me {
-			req := &AppendEntriesArgs{}
-			req.Term = rf.getRaftTerm()
-			req.LeaderId = rf.me
-			req.LeaderCommit = rf.commitIndex
-			req.PrevLogIndex = preLogIndex
-			req.PrevLogTerm = preLogTerm
-			req.Entries = append(req.Entries, newLogEntry)
-			reply := &AppendEntriesReply{}
+			if !rf.lockFollowerAppendEntry(tmpI) {
+				continue
+			}
+			rf.nextIndexMap[tmpI] = len(rf.logEntries) - 1
 			go func() {
-				for !rf.getRaftIsShutdown() && rf.nodeRole == LEADER {
+				for !rf.getRaftIsShutdown() && rf.getRaftRole() == LEADER {
+					begin0 := GetNowMilliTime()
+					req := &AppendEntriesArgs{}
+					req.Term = rf.getRaftTerm()
+					req.LeaderId = rf.me
+					req.LeaderCommit = rf.commitIndex
+					req.PrevLogIndex = rf.nextIndexMap[tmpI] - 1
+					req.PrevLogTerm = rf.logEntries[req.PrevLogIndex].Term
+					nextLogEntry := rf.logEntries[rf.nextIndexMap[tmpI]]
+					BPrintf("term=%d role=%s rf =%d 连接%d,nextIndex=%d,len(entry)=%d,cmd=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI, rf.nextIndexMap[tmpI], len(rf.logEntries), nextLogEntry.Command.(int))
+					req.Entries = append(req.Entries, nextLogEntry)
+					reply := &AppendEntriesReply{}
 					result := rf.sendAppendEntries(tmpI, req, reply)
 					if !result { //网络异常，重试
+						BPrintf("term=%d role=%s rf =%d 连接%d时网络异常，发起重试请求，耗时=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI, GetNowMilliTime()-begin0)
 						continue
 					}
 					//如果是term比较小的原因，那么leader就需要退回follower了
-					if reply.Term > rf.getRaftTerm() || reply.Succ == true {
+					if reply.Term > rf.getRaftTerm() {
+
 						//						BPrintf("term=%d role=%s rf =%d 请求%d追加日志的操作成功", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI)
-						appendEntryResult <- reply
-						return
+						if !chanIsClosed(appendEntryResult) {
+							appendEntryResult <- reply
+						}
+						break
+					} else if reply.Succ {
+						rf.nextIndexMap[tmpI]++
 					} else if !reply.Succ { //如果不是因为term导致失败，那么一定是因为log不匹配
-						tmpEntry := rf.logEntries[preLogIndex-1] //回退一格日志
-						req.PrevLogIndex = preLogIndex - 1
-						req.PrevLogTerm = tmpEntry.Term
-						req.Term = rf.getRaftTerm()
-						req.Entries = rf.logEntries[req.PrevLogIndex:]
-						BPrintf("term=%d role=%s rf =%d prevLogIndex不匹配，回退一格", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
+						rf.nextIndexMap[tmpI]--
+						BPrintf("term=%d role=%s rf =%d prevLogIndex与%d的不匹配，回退一格", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI)
+					}
+					if rf.nextIndexMap[tmpI] == len(rf.logEntries) {
+						if !chanIsClosed(appendEntryResult) {
+							appendEntryResult <- reply
+						}
+						break
 					}
 				}
+				rf.unlockFollowerAppendEntry(tmpI)
 			}()
 		}
 	}
@@ -522,17 +598,19 @@ func (rf *Raft) leaderSendAppendEntries(command interface{}) {
 			rf.becomeFollower(NONE)
 			rf.setElectionTimeOut()
 			rf.setLastLeaderHeartBeatTime()
-			BPrintf("term=%d,role=%d,rf=%d 在追加日志的过程中，发现更高的term，退回follower", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
+			BPrintf("term=%d,role=%s,rf=%d 在追加日志的过程中，发现更高的term，退回follower", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
+			close(appendEntryResult)
+			break
 		}
 		if succ >= major {
 			//			BPrintf("term=%d,role=%s,rf=%d 大多数的节点已经接收到日志，耗时=%d,succ=", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, (GetNowMilliTime() - begin), succ)
-			rf.applyMsg2StateMachine(newLogEntry)
-			rf.leaderUpdateCommitIndex(rf.getLeaderCommitIndex() + 1)
+			//			rf.applyMsg2StateMachine(newLogEntry)
+			rf.updateCommitIndex(rf.getCommitIndex() + 1)
+			close(appendEntryResult)
 			break
 		}
 	}
 	//	BPrintf("term=%d,role=%s,rf=%d 完成日志追加操作，耗时=%d,succ=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, (GetNowMilliTime() - begin), succ)
-	rf.logEntryLock.Unlock()
 }
 
 //模拟提交到状态机的操作
@@ -593,15 +671,28 @@ func (rf *Raft) applyCommittedMsg2StateMachine() {
 		time.Sleep(time.Duration(5) * time.Millisecond)
 		//		rf.mu.Lock()
 		//		defer rf.mu.Unlock()
-		if rf.currentIndex == rf.commitIndex {
+		commitIndex := rf.getCommitIndex()
+		if rf.currentIndex == commitIndex {
 			continue
 		}
-		toCommitArray := rf.logEntries[rf.currentIndex+1 : rf.commitIndex+1]
-		for i := 0; i < len(toCommitArray); i++ {
-			rf.applyMsg2StateMachine(toCommitArray[i])
+		//		BPrintf("term=%d,rf=%d,role=%s  applyMsg,logLen=%d,currentIndex=%d,commitIndex=%d", rf.getRaftTerm(), rf.me, getRole(rf.getRaftRole()),
+		//			len(rf.logEntries), rf.currentIndex, rf.getCommitIndex())
+		allCommitLen := len(rf.logEntries) - 1
+		end := allCommitLen
+		if commitIndex < allCommitLen {
+			end = commitIndex
 		}
-		rf.currentIndex = rf.commitIndex
-
+		//		println(rf.currentIndex, end+1)
+		toCommitArray := rf.logEntries[rf.currentIndex+1 : end+1]
+		for i := 0; i < len(toCommitArray); i++ {
+			//			BPrintf("term=%d,applyMsgcccc_rf=%d,role=%s  applyMsgcccc,index=%d,cmd=%d,currentIndex=%d,commitIndex=%d,logLen=%d", rf.getRaftTerm(), rf.me, getRole(rf.getRaftRole()),
+			//				toCommitArray[i].Index, toCommitArray[i].Command.(int), rf.currentIndex, rf.getCommitIndex(), allCommitLen)
+			rf.applyMsg2StateMachine(toCommitArray[i])
+			rf.currentIndex++
+		}
+		//		rf.currentIndex = rf.getCommitIndex()
+		//		BPrintf("term=%d,applyMsgxxx_rf=%d,role=%s  applyMsgxxx,logLen=%d,currentIndex=%d,commitIndex=%d,logLen=%d", rf.getRaftTerm(), rf.me, getRole(rf.getRaftRole()),
+		//			len(rf.logEntries), rf.currentIndex, rf.getCommitIndex(), allCommitLen)
 	}
 }
 
@@ -647,8 +738,9 @@ func (rf *Raft) startElection() {
 			voteArgs := &RequestVoteArgs{}
 			voteArgs.Term = rf.getRaftTerm()
 			voteArgs.CandidateId = rf.me
-			voteArgs.LastLogIndex = 0
-			voteArgs.LastLogTerm = 0
+			lastLogEntry := rf.logEntries[len(rf.logEntries)-1]
+			voteArgs.LastLogIndex = lastLogEntry.Index
+			voteArgs.LastLogTerm = lastLogEntry.Term
 			voteReply := &RequestVoteReply{}
 			result := rf.sendRequestVote(tmpIndex, voteArgs, voteReply)
 			if result {
@@ -682,10 +774,15 @@ func (rf *Raft) startElection() {
 	//Q:如何判定在收集候选者期间，已经有leader联系自己了
 	//A:存在leader的情况下，选举必然失败，那么可以通过leader的心跳感知，然后退回follower
 	if succ >= majority {
-		rf.setRaftRole(LEADER)
-		rf.setVotedFor(rf.me)
-		DPrintf("term=%d,role=%s,rf=%d 成为leader,耗时%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, costTime)
+		rf.mu.Lock()
+		rf.nodeRole = LEADER
+		rf.initNextIndex()
+		rf.votedFor = rf.me
+		rf.mu.Unlock()
+		//		DPrintf("term=%d,role=%s,rf=%d 成为leader,耗时%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, costTime)
+		BPrintf("term=%d,role=%s,rf=%d 成为leader,耗时%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, costTime)
 		go rf.maintainLeader()
+
 	} else {
 		if biggerTermFlag {
 			DPrintf("term=%d,role=%s,rf=%d 候选者检测到了更高的term，退化为follower，耗时%d", rf.getRaftTerm(), getRole(rf.getRaftRole()),
@@ -713,7 +810,7 @@ func (rf *Raft) maintainLeader() {
 		req := &AppendEntriesArgs{}
 		reply := &AppendEntriesReply{}
 		begin := GetNowMilliTime()
-		req.LeaderCommit = rf.commitIndex
+		req.LeaderCommit = rf.getCommitIndex()
 		req.Term = rf.getRaftTerm()
 		req.LeaderId = rf.me
 		req.Me = rf.me
@@ -722,6 +819,7 @@ func (rf *Raft) maintainLeader() {
 		n := len(rf.peers)
 		chnResult := make(chan *AppendEntriesReply, n)
 		DPrintf("term=%d,role=%s,rf=%d 开始发送leader心跳", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
+		majority := (len(rf.peers) + 1) / 2
 		for index := range rf.peers {
 			tmpIndex := index
 			go func() {
@@ -753,7 +851,8 @@ func (rf *Raft) maintainLeader() {
 		//当大多数的心跳和网络请求失败，那么需要考虑当前节点退回follower的情况
 		succ := 0
 		networkError := 0
-		//当发生网络异常的时候，心跳请求可能无法返回，所以需要对请求附加超时机制?
+		//Q当发生网络异常的时候，心跳请求可能无法返回，所以需要对请求附加超时机制?
+		//A 是的，必须有超时机制，或者说大部分返回就直接进行下一步，否则会影响下次心跳的产生，从而使follower认为leader挂了
 		biggerTermFlag := false
 		for reply := range chnResult {
 			tmp++
@@ -765,13 +864,14 @@ func (rf *Raft) maintainLeader() {
 			if reply != nil && reply.Term > rf.getRaftTerm() {
 				rf.setRaftTerm(reply.Term)
 				biggerTermFlag = true
+				break
 			}
-			if tmp == n {
+			if networkError >= majority || succ >= majority || tmp == n {
 				break
 			}
 		}
 		if biggerTermFlag {
-			DPrintf("term=%d,role=%d,rf=%d 检测到了更大的term，由leader退回follower，发起心跳时的term=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, currentTerm)
+			BPrintf("term=%d,role=%s,rf=%d 检测到了更大的term，由leader退回follower，发起心跳时的term=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, currentTerm)
 			rf.becomeFollower(NONE)
 			rf.setElectionTimeOut()
 			rf.setLastLeaderHeartBeatTime()
@@ -781,10 +881,10 @@ func (rf *Raft) maintainLeader() {
 			rf.becomeFollower(NONE)
 			rf.setElectionTimeOut()
 			rf.setLastLeaderHeartBeatTime()
-			DPrintf("term=%d,role=%s,rf=%d 当前节点网络超时，由leader退回follower,耗时=%d，失联时的term为=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, GetNowMilliTime()-begin, currentTerm)
+			BPrintf("term=%d,role=%s,rf=%d 当前节点网络超时，由leader退回follower,耗时=%d，失联时的term为=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, GetNowMilliTime()-begin, currentTerm)
 			return
 		}
-		DPrintf("term=%d,role=%s,rf=%d leader心跳已完成,succ=%d,networkError=%d，发起心跳时的term=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError, currentTerm)
+		DPrintf("term=%d,role=%s,rf=%d leader心跳已完成,succ=%d,networkError=%d，发起心跳时的term=%d,耗时=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, succ, networkError, currentTerm, GetNowMilliTime()-begin)
 		time.Sleep(time.Duration(rf.raftHeartBeatIntervalMilli) * time.Millisecond)
 	}
 }

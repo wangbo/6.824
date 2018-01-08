@@ -46,21 +46,6 @@ func TestInitialElection2A(t *testing.T) {
 	fmt.Printf("  ... Passed\n")
 }
 
-func TestReElection2X(t *testing.T) {
-	servers := 3
-	cfg := make_config(t, servers, false)
-	defer cfg.cleanup()
-
-	fmt.Printf("Test (2A): election after network failure ...\n")
-
-	leader1 := cfg.checkOneLeader()
-
-	// if the leader disconnects, a new one should be elected.
-	cfg.disconnect(leader1)
-	DPrintf("leader%d已离线", leader1)
-	time.Sleep(30 * time.Second)
-}
-
 func TestReElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false)
@@ -140,6 +125,7 @@ func TestFailAgree2B(t *testing.T) {
 
 	// follower network disconnection
 	leader := cfg.checkOneLeader()
+	println("即将失联的节点为", (leader+1)%servers)
 	cfg.disconnect((leader + 1) % servers)
 
 	// agree despite one disconnected server?
@@ -149,12 +135,14 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.one(104, servers-1)
 	cfg.one(105, servers-1)
 
+	println((leader+1)%servers, "重新连回集群")
 	// re-connect
 	cfg.connect((leader + 1) % servers)
 
 	// agree with full set of servers?
 	cfg.one(106, servers)
 	time.Sleep(RaftElectionTimeout)
+
 	cfg.one(107, servers)
 
 	fmt.Printf("  ... Passed\n")
