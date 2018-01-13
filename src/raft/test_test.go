@@ -29,7 +29,7 @@ func TestInitialElection2A(t *testing.T) {
 	fmt.Printf("Test (2A): initial election ...\n")
 	//	time.Sleep(10 * time.Second)
 	// is a leader elected?
-	//	cfg.checkOneLeader()
+	cfg.checkOneLeader()
 
 	// does the leader+term stay the same if there is no network failure?
 	term1 := cfg.checkTerms()
@@ -42,7 +42,6 @@ func TestInitialElection2A(t *testing.T) {
 	//	time.Sleep(10 * time.Second)
 	//	println("------------------------------------------------------------")
 	cfg.checkOneLeader()
-	time.Sleep(10 * time.Minute)
 	fmt.Printf("  ... Passed\n")
 }
 
@@ -162,6 +161,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.disconnect((leader + 1) % servers)
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
+	BPrintf("disconnect,%d,%d,%d", (leader+1)%servers, (leader+2)%servers, (leader+3)%servers)
 
 	index, _, ok := cfg.rafts[leader].Start(20)
 	if ok != true {
@@ -183,10 +183,14 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
 
+	//debug
+	BPrintf("repair,%d,%d,%d", (leader+1)%servers, (leader+2)%servers, (leader+3)%servers)
+
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
 	// or perhaps
 	leader2 := cfg.checkOneLeader()
+	fmt.Printf("30..................")
 	index2, _, ok2 := cfg.rafts[leader2].Start(30)
 	if ok2 == false {
 		t.Fatalf("leader2 rejected Start()")
@@ -194,7 +198,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	if index2 < 2 || index2 > 3 {
 		t.Fatalf("unexpected index %v", index2)
 	}
-
+	fmt.Printf("1000..................")
 	cfg.one(1000, servers)
 
 	fmt.Printf("  ... Passed\n")

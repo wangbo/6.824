@@ -454,7 +454,7 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 				//				println("cmd=", cmd, "cmd2=", cmd1.(int), ",index=", index)
 				time.Sleep(20 * time.Millisecond)
 			}
-			//			cfg.t.Fatalf("one(%v) failed to reach agreement999 index=%d", cmd, index)
+			cfg.t.Fatalf("one(%v) failed to reach agreement index=%d", cmd, index)
 		} else {
 			time.Sleep(50 * time.Millisecond)
 		}
