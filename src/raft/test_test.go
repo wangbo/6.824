@@ -84,9 +84,9 @@ func TestReElection2A(t *testing.T) {
 	DPrintf("所有失联节点重新上线，开始检查leader")
 	cfg.checkOneLeader()
 
+	//	time.Sleep(5 * time.Second)
 	fmt.Printf("  ... Passed\n")
 
-	//	time.Sleep(30 * time.Second)
 	//	println(leader2)
 }
 
@@ -138,6 +138,7 @@ func TestFailAgree2B(t *testing.T) {
 	// re-connect
 	cfg.connect((leader + 1) % servers)
 
+	time.Sleep(2 * time.Second)
 	// agree with full set of servers?
 	cfg.one(106, servers)
 	time.Sleep(RaftElectionTimeout)
