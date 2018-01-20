@@ -133,6 +133,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
+	isleader = false
 	// Your code here (2A).
 	if rf.getRaftRole() == LEADER {
 		isleader = true
@@ -332,7 +333,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply)
 					}
 					DPrintf("term=%d,role=%s,rf=%d 更新commitIndex=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, rf.getCommitIndex())
 				}
-				DPrintf("term=%d,role=%s,rf=%d 确认%d的心跳,req.Term=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.LeaderId, req.Term)
+				DPrintf("term=%d,role=%s,rf=%d 确认%d的心跳,req.Term=%d,rf.commitIndex=%d,req.commitIndex=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.LeaderId, req.Term, rf.getCommitIndex(), req.LeaderCommit)
 			}
 			rf.mu.Lock()
 			if !rf.leaderHeartCheckerSwitch {
@@ -485,15 +486,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := false
 
 	// Your code here (2B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	//	rf.mu.Lock()
+	//	defer rf.mu.Unlock()
+	rf.appendEntrySerialLock.Lock()
+	defer rf.appendEntrySerialLock.Unlock()
 	index = rf.getLogEntryLength()
-	term = rf.currentTerm
+	term = rf.getRaftTerm()
 	if rf.nodeRole == LEADER {
 		//		BPrintf("找打了leader,%d,role=%s", rf.me, getRole(rf.nodeRole))
 		isLeader = true
-		go rf.leaderSendAppendEntries(command)
+		newLogEntry := rf.appendLogEntry(command)
+		rf.leaderSendAppendEntries(newLogEntry)
+		//		go rf.leaderSendAppendEntries(newLogEntry)
+		//		rf.leaderSendAppendEntries(command)
+		//		println("applSucc,cmd=", command.(int))
 	}
+	//	println("applSucc,cmd=", command.(int))
 	return index, term, isLeader
 }
 
@@ -552,6 +560,7 @@ func (rf *Raft) appendLogEntry(command interface{}) LogEntry {
 	logEntry.Command = command
 	logEntry.Index = len(rf.logEntries)
 	logEntry.Term = rf.getRaftTerm()
+	//	logEntry.Term = rf.currentTerm
 	rf.logEntries = append(rf.logEntries, logEntry)
 	return logEntry
 }
@@ -589,15 +598,18 @@ func (rf *Raft) setNextIndexMapValueDecrement(rfIndex int) {
 
 //在leader的心跳中，更新已提交的commitIndex
 //生产环境应该需要添加重试机制
-func (rf *Raft) leaderSendAppendEntries(command interface{}) {
-	//每次优先追加日志，然后再说同步的事
-	newLogEntry := rf.appendLogEntry(command)
-	BPrintf("term=%d role=%s rf=%d 开始追加日志，cmd=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, command)
-	rf.appendEntrySerialLock.Lock()
-	defer rf.appendEntrySerialLock.Unlock()
+func (rf *Raft) leaderSendAppendEntries(newLogEntry LogEntry) {
+	//	rf.appendEntrySerialLock.Lock()
+	//	defer rf.appendEntrySerialLock.Unlock()
+	//每次优先追加日志，然后再说同步的事 why
+	//	newLogEntry := rf.appendLogEntry(command)
+	BPrintf("term=%d role=%s rf=%d 开始追加日志，cmd=%d,index=%d,term=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, newLogEntry.Command.(int), newLogEntry.Index, newLogEntry.Term)
+
 	begin := GetNowMilliTime()
 
-	tmpNextIndex := rf.getLogEntryLength() - 1
+	//	tmpNextIndex := rf.getLogEntryLength() - 1
+	tmpNextIndex := newLogEntry.Index
+	currentSubmitEndIndex := tmpNextIndex + 1
 
 	//	BPrintf("term=%d role=%s rf=%d 开始追加日志，cmd=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, command)
 	appendEntryResult := make(chan *AppendEntriesReply, len(rf.peers)-1)
@@ -633,7 +645,7 @@ func (rf *Raft) leaderSendAppendEntries(command interface{}) {
 					nextLogEntry := rf.getTargetIndexLogEntry(rfNextIndexMapValue)
 
 					BPrintf("term=%d role=%s rf =%d 连接%d,entry.Index=%d,entry.Cmd=%d,len(rf.logEntry)=%d,nextIndex=%d",
-						rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI, newLogEntry.Index, nextLogEntry.Command.(int), rf.getLogEntryLength(), rfNextIndexMapValue)
+						rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI, nextLogEntry.Index, nextLogEntry.Command.(int), rf.getLogEntryLength(), rfNextIndexMapValue)
 					req.Entries = append(req.Entries, nextLogEntry)
 					reply := &AppendEntriesReply{}
 					//					result := rf.sendAppendEntries(tmpI, req, reply)
@@ -667,7 +679,7 @@ func (rf *Raft) leaderSendAppendEntries(command interface{}) {
 						BPrintf("term=%d role=%s rf =%d prevLogIndex与%d的不匹配，回退一格", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI)
 					}
 					tmpXX := rf.getNextIndexMapValue(tmpI)
-					if tmpXX == rf.getLogEntryLength() {
+					if tmpXX == currentSubmitEndIndex {
 						//						if !chanIsClosed(appendEntryResult) {
 						appendEntryResult <- reply
 						//						}
@@ -706,7 +718,7 @@ func (rf *Raft) leaderSendAppendEntries(command interface{}) {
 			break
 		}
 	}
-	BPrintf("term=%d,role=%s,rf=%d 完成日志追加操作，耗时=%d,succ=%d,commitIndex=%d,cmd=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, (GetNowMilliTime() - begin), succ, rf.getCommitIndex(), command.(int))
+	BPrintf("term=%d,role=%s,rf=%d 完成日志追加操作，耗时=%d,succ=%d,commitIndex=%d,cmd=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, (GetNowMilliTime() - begin), succ, rf.getCommitIndex(), newLogEntry.Command.(int))
 }
 
 //模拟提交到状态机的操作
@@ -784,8 +796,8 @@ func (rf *Raft) applyCommittedMsg2StateMachine() {
 		toCommitArray := rf.logEntries[rf.currentIndex+1 : end+1]
 		rf.logEntryLock.Unlock()
 		for i := 0; i < len(toCommitArray); i++ {
-			//			BPrintf("term=%d,applyMsgcccc_rf=%d,role=%s  applyMsgcccc,index=%d,cmd=%d,currentIndex=%d,commitIndex=%d,logLen=%d", rf.getRaftTerm(), rf.me, getRole(rf.getRaftRole()),
-			//				toCommitArray[i].Index, toCommitArray[i].Command.(int), rf.currentIndex, rf.getCommitIndex(), allCommitLen)
+			BPrintf("term=%d,applyMsgcccc_rf=%d,role=%s  applyMsgcccc,index=%d,cmd=%d,currentIndex=%d,commitIndex=%d,logLen=%d", rf.getRaftTerm(), rf.me, getRole(rf.getRaftRole()),
+				toCommitArray[i].Index, toCommitArray[i].Command.(int), rf.currentIndex, rf.getCommitIndex(), allCommitLen)
 			rf.applyMsg2StateMachine(toCommitArray[i])
 			rf.currentIndex++
 		}

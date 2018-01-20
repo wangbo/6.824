@@ -241,6 +241,7 @@ loop:
 				if ok != true {
 					return
 				}
+				//				println("send=", i)
 				is <- i
 			}(ii)
 		}
@@ -248,6 +249,7 @@ loop:
 		wg.Wait()
 		close(is)
 
+		//		println("x123")
 		for j := 0; j < servers; j++ {
 			if t, _ := cfg.rafts[j].GetState(); t != term {
 				// term changed -- can't expect low RPC counts
@@ -258,6 +260,7 @@ loop:
 		failed := false
 		cmds := []int{}
 		for index := range is {
+			//			println("recev=", index)
 			cmd := cfg.wait(index, servers, term)
 			if ix, ok := cmd.(int); ok {
 				if ix == -1 {
