@@ -13,7 +13,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 // Debugging
-const DebugB = 0
+const DebugB = 1
 
 func BPrintf(format string, a ...interface{}) (n int, err error) {
 	if DebugB > 0 {
