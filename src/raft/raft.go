@@ -66,6 +66,12 @@ type AppendEntriesReply struct {
 	//	IsLogMatch bool //标记当前日志追加失败的操作是否为日志不匹配引起的
 }
 
+type OutComingResult struct {
+	Reply         *AppendEntriesReply
+	InputLogEntry LogEntry
+	FollowerId    int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -102,11 +108,22 @@ type Raft struct {
 	nextIndexFlagMap  map[int]int //标志位，如果为1,则表示当前有协程在处理和follower的同步操作，如果为0则表示没有
 	nextIndexFlagLock sync.Mutex  //更新nextIndexFlagMap时需要保证线程安全
 
-	appendEntrySerialLock sync.Mutex //保证leader追加日志的操作串行，上一波日志没有提交完成，下一波不能提交
-	maitainLeaderLock     sync.Mutex //为maintainleader的操作串行化
+	appendEntrySerialLock  sync.Mutex            //保证leader追加日志的操作串行，上一波日志没有提交完成，下一波不能提交
+	maitainLeaderLock      sync.Mutex            //为maintainleader的操作串行化
+	logInComingChanMap     map[int]chan LogEntry //顺序的保证对于各个follower的日志的提交
+	logInComingChanMapLock sync.Mutex            //加锁防止出现并发访问的问题
+
+	logOutComingChan     chan OutComingResult //用于把日志提交的结果返回给提交日志的协程
+	logOutComingChanLock sync.Mutex           ///线程同步
 
 	opCount     int
 	opCountLock sync.Mutex
+}
+
+func (rf *Raft) getTargetlogInComingChanMap(i int) chan LogEntry {
+	rf.logInComingChanMapLock.Lock()
+	defer rf.logInComingChanMapLock.Unlock()
+	return rf.logInComingChanMap[i]
 }
 
 func (rf *Raft) getLogEntryLength() int {
@@ -333,7 +350,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply)
 					}
 					DPrintf("term=%d,role=%s,rf=%d 更新commitIndex=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, rf.getCommitIndex())
 				}
-				DPrintf("term=%d,role=%s,rf=%d 确认%d的心跳,req.Term=%d,rf.commitIndex=%d,req.commitIndex=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.LeaderId, req.Term, rf.getCommitIndex(), req.LeaderCommit)
+				DPrintf("term=%d,role=%s,rf=%d 确认%d的心跳,req.Term=%d,rf.commitIndex=%d,req.commitIndex=%d,len(logEntry)=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, req.LeaderId, req.Term, rf.getCommitIndex(), req.LeaderCommit, rf.getLogEntryLength())
 			}
 			rf.mu.Lock()
 			if !rf.leaderHeartCheckerSwitch {
@@ -377,11 +394,11 @@ func (rf *Raft) AppendEntries(req *AppendEntriesArgs, reply *AppendEntriesReply)
 			//			} else {
 			//				rf.updateCommitIndex(req.LeaderCommit)
 			//			}
-			BPrintf("term=%d,role=%s,rf=%d 认同leader的日志追加操作,entry.cmd=%d,entry.index=%d,len(rf.logEntries)=%d,commitedIndex=%d",
+			AllPrintf("term=%d,role=%s,rf=%d 认同leader的日志追加操作,entry.cmd=%d,entry.index=%d,len(rf.logEntries)=%d,commitedIndex=%d",
 				rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, newLogEntry.Command.(int), newLogEntry.Index, len(rf.logEntries), rf.getCommitIndex())
 		} else {
 			reply.Succ = false
-			BPrintf("term=%d,role=%s,rf=%d 指定位置的term不匹配，拒绝追加操作,cmd=", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me,
+			AllPrintf("term=%d,role=%s,rf=%d 指定位置的term不匹配，拒绝追加操作,cmd=", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me,
 				req.Entries[0].Command.(int))
 		}
 	}
@@ -596,6 +613,129 @@ func (rf *Raft) setNextIndexMapValueDecrement(rfIndex int) {
 	rf.nextIndexMap[rfIndex]--
 }
 
+//需要把日志发送的部分封装为一个方法，然后在外层包装管道和协程
+func (rf *Raft) sendLogEntry(logEntry LogEntry, followerIndex int, appendEntryResult chan *AppendEntriesReply) {
+	nextLogIndex := logEntry.Index
+	rf.setNextIndexMapValue(followerIndex, nextLogIndex)
+	currentTerm := logEntry.Term
+	for !rf.getRaftIsShutdown() && rf.getRaftRole() == LEADER {
+		begin0 := GetNowMilliTime()
+		req := &AppendEntriesArgs{}
+		req.Term = rf.getRaftTerm()
+		req.LeaderId = rf.me
+		req.LeaderCommit = rf.getCommitIndex()
+
+		rfNextIndexMapValue := rf.getNextIndexMapValue(followerIndex)
+		req.PrevLogIndex = rfNextIndexMapValue - 1
+
+		req.PrevLogTerm = rf.getTargetIndexLogEntry(req.PrevLogIndex).Term
+		nextLogEntry := rf.getTargetIndexLogEntry(rfNextIndexMapValue)
+
+		AllPrintf("term=%d role=%s rf =%d 连接%d,entry.Index=%d,entry.Cmd=%d,len(rf.logEntry)=%d,nextIndex=%d",
+			rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, followerIndex, nextLogEntry.Index, nextLogEntry.Command.(int), rf.getLogEntryLength(), rfNextIndexMapValue)
+		req.Entries = append(req.Entries, nextLogEntry)
+		reply := &AppendEntriesReply{}
+		result := rf.sendAppendEntriesWithTimeout(followerIndex, req, reply, rf.electionTimeoutMS)
+		if !result { //网络异常，重试
+			if currentTerm != rf.getRaftTerm() {
+				BPrintf("term=%d role=%s rf =%d 连接%d时检测到term变化，退出当前appendEntry循环，初始term=%d,当前term=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, followerIndex, currentTerm, rf.getRaftTerm())
+				reply.Succ = false
+				reply.Term = -999
+				appendEntryResult <- reply
+				break
+			}
+			BPrintf("term=%d role=%s rf =%d 连接%d时网络异常，发起重试请求，耗时=%d，发起请求时的term为%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, followerIndex, GetNowMilliTime()-begin0, currentTerm)
+			continue
+		}
+		//如果是term比较小的原因，那么leader就需要退回follower了
+		if reply.Term > rf.getRaftTerm() {
+			//						BPrintf("term=%d role=%s rf =%d 请求%d追加日志的操作成功", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI)
+			appendEntryResult <- reply
+			break
+		} else if reply.Succ {
+			rf.setNextIndexMapValueIncrement(followerIndex)
+		} else if !reply.Succ { //如果不是因为term导致失败，那么一定是因为log不匹配
+			rf.setNextIndexMapValueDecrement(followerIndex)
+			BPrintf("term=%d role=%s rf =%d prevLogIndex与%d的不匹配，回退一格", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, followerIndex)
+		}
+		if rf.getNextIndexMapValue(followerIndex)-1 == nextLogIndex {
+			go func() {
+				appendEntryResult <- reply
+			}()
+			break
+		}
+	}
+}
+
+func (rf *Raft) getInComingChanMap() map[int]chan LogEntry {
+	rf.logInComingChanMapLock.Lock()
+	defer rf.logInComingChanMapLock.Unlock()
+	return rf.logInComingChanMap
+}
+
+func (rf *Raft) newInComingChanMap() {
+	rf.logInComingChanMapLock.Lock()
+	defer rf.logInComingChanMapLock.Unlock()
+	rf.logInComingChanMap = make(map[int]chan LogEntry)
+}
+
+func (rf *Raft) newOneInComingChan(i int) {
+	rf.logInComingChanMapLock.Lock()
+	defer rf.logInComingChanMapLock.Unlock()
+	//管道的长度可以设置，如果打满的话，此时无法提交新的请求，集群可能是出现了资源紧张的情况
+	rf.logInComingChanMap[i] = make(chan LogEntry, 10)
+}
+
+func (rf *Raft) getOneInComingChan(i int) chan LogEntry {
+	rf.logInComingChanMapLock.Lock()
+	defer rf.logInComingChanMapLock.Unlock()
+	return rf.logInComingChanMap[i]
+}
+
+func (rf *Raft) newLogOutComingChan() {
+	rf.logOutComingChanLock.Lock()
+	defer rf.logOutComingChanLock.Unlock()
+	rf.logOutComingChan = make(chan OutComingResult, 10)
+}
+
+func (rf *Raft) getLogOutComingChan() chan OutComingResult {
+	rf.logOutComingChanLock.Lock()
+	defer rf.logOutComingChanLock.Unlock()
+	return rf.logOutComingChan
+}
+
+//启动三个协程专门用于日志的提交
+//返回时也需要携带logEntry信息，只有和提交的logEntry相匹配才能判定为提交成功，因为管道中可能会有logEntry的堆积
+func (rf *Raft) initCoroutine4EntrySubmit() {
+	rf.newInComingChanMap()
+	rf.newLogOutComingChan()
+	//记录启动时的term，如果后续的check中发现不一致，那么说明节点过时，需要退出协程
+	initTerm := rf.getRaftTerm()
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		rf.newOneInComingChan(i)
+		go func(followerId int) {
+			incomingChan := rf.getTargetlogInComingChanMap(followerId)
+			for logEntry := range incomingChan {
+				if rf.getRaftTerm() != initTerm || rf.getRaftIsShutdown() || rf.getRaftRole() != LEADER {
+					AllPrintf("term=%d role=%s rf=%d 检测到当前节点已经过时，退出日志提交协程，初始term为=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, initTerm)
+					return
+				}
+
+				result := make(chan *AppendEntriesReply)
+				rf.sendLogEntry(logEntry, followerId, result)
+				BPrintf("term=%d role=%s rf=%d sendLogEntry=%d return", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, followerId)
+				var outComingResult OutComingResult
+				outComingResult.Reply = <-result
+				outComingResult.InputLogEntry = logEntry
+				rf.getLogOutComingChan() <- outComingResult
+			}
+		}(i)
+	}
+}
+
 //在leader的心跳中，更新已提交的commitIndex
 //生产环境应该需要添加重试机制
 func (rf *Raft) leaderSendAppendEntries(newLogEntry LogEntry) {
@@ -608,111 +748,54 @@ func (rf *Raft) leaderSendAppendEntries(newLogEntry LogEntry) {
 	begin := GetNowMilliTime()
 
 	//	tmpNextIndex := rf.getLogEntryLength() - 1
-	tmpNextIndex := newLogEntry.Index
-	currentSubmitEndIndex := tmpNextIndex + 1
+	//	tmpNextIndex := newLogEntry.Index
+	//	currentSubmitEndIndex := tmpNextIndex + 1
 
 	//	BPrintf("term=%d role=%s rf=%d 开始追加日志，cmd=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, command)
-	appendEntryResult := make(chan *AppendEntriesReply, len(rf.peers)-1)
+	//	appendEntryResult := make(chan *AppendEntriesReply, len(rf.peers)-1)
+	//	initTerm := rf.getRaftTerm()
 	for i := range rf.peers {
-		tmpI := i
-		if tmpI != rf.me {
-			if !rf.lockFollowerAppendEntry(tmpI) {
-				continue
-			}
-			go func() {
-				//初始化下一个发送到follower的entry
-				//				rf.nextIndexMap[tmpI] = tmpNextIndex
-				initTerm := rf.getRaftTerm()
-				rf.setNextIndexMapValue(tmpI, tmpNextIndex)
-				for !rf.getRaftIsShutdown() && rf.getRaftRole() == LEADER {
-					begin0 := GetNowMilliTime()
-					req := &AppendEntriesArgs{}
-					req.Term = rf.getRaftTerm()
-					req.LeaderId = rf.me
-					req.LeaderCommit = rf.getCommitIndex()
-
-					rfNextIndexMapValue := rf.getNextIndexMapValue(tmpI)
-					req.PrevLogIndex = rfNextIndexMapValue - 1
-
-					if req.PrevLogIndex >= rf.getLogEntryLength() || req.PrevLogIndex < 0 {
-						BPrintf("term=%d role=%s rf =%d 连接%d，req.PrevLogIndex捕捉到数组越界异常,req.PrevIndex=%d,len(rf.logEntry)=%d,nextIndex=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI, req.PrevLogIndex, rf.getLogEntryLength(), rfNextIndexMapValue)
-					}
-					req.PrevLogTerm = rf.getTargetIndexLogEntry(req.PrevLogIndex).Term
-					//这里会有越界异常
-					if rfNextIndexMapValue >= rf.getLogEntryLength() || rfNextIndexMapValue < 0 {
-						BPrintf("term=%d role=%s rf =%d 连接%d，捕捉到数组越界异常,nextIndex=%d,len(rf.logEntry)=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI, rfNextIndexMapValue, rf.getLogEntryLength())
-					}
-					nextLogEntry := rf.getTargetIndexLogEntry(rfNextIndexMapValue)
-
-					BPrintf("term=%d role=%s rf =%d 连接%d,entry.Index=%d,entry.Cmd=%d,len(rf.logEntry)=%d,nextIndex=%d",
-						rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI, nextLogEntry.Index, nextLogEntry.Command.(int), rf.getLogEntryLength(), rfNextIndexMapValue)
-					req.Entries = append(req.Entries, nextLogEntry)
-					reply := &AppendEntriesReply{}
-					//					result := rf.sendAppendEntries(tmpI, req, reply)
-					//					rf.sendAppendEntriesWithTimeout()
-					result := rf.sendAppendEntriesWithTimeout(tmpI, req, reply, rf.electionTimeoutMS)
-					if !result { //网络异常，重试
-						if initTerm != rf.getRaftTerm() {
-							BPrintf("term=%d role=%s rf =%d 连接%d时检测到term变化，退出当前appendEntry循环，初始term=%d,当前term=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI, initTerm, rf.getRaftTerm())
-							reply.Succ = false
-							reply.Term = -999
-							appendEntryResult <- reply
-							break
-						}
-						BPrintf("term=%d role=%s rf =%d 连接%d时网络异常，发起重试请求，耗时=%d，发起请求时的term为%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI, GetNowMilliTime()-begin0, initTerm)
-						continue
-					}
-					//如果是term比较小的原因，那么leader就需要退回follower了
-					if reply.Term > rf.getRaftTerm() {
-
-						//						BPrintf("term=%d role=%s rf =%d 请求%d追加日志的操作成功", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI)
-						//						if !chanIsClosed(appendEntryResult) {
-						appendEntryResult <- reply
-						//						}
-						break
-					} else if reply.Succ {
-						//						rf.nextIndexMap[tmpI]++
-						rf.setNextIndexMapValueIncrement(tmpI)
-					} else if !reply.Succ { //如果不是因为term导致失败，那么一定是因为log不匹配
-						//						rf.nextIndexMap[tmpI]--
-						rf.setNextIndexMapValueDecrement(tmpI)
-						BPrintf("term=%d role=%s rf =%d prevLogIndex与%d的不匹配，回退一格", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, tmpI)
-					}
-					tmpXX := rf.getNextIndexMapValue(tmpI)
-					if tmpXX == currentSubmitEndIndex {
-						//						if !chanIsClosed(appendEntryResult) {
-						appendEntryResult <- reply
-						//						}
-						break
-					}
-				}
-				rf.unlockFollowerAppendEntry(tmpI)
-			}()
+		if i != rf.me {
+			rf.getOneInComingChan(i) <- newLogEntry
+			//			if !rf.lockFollowerAppendEntry(i) {
+			//				println(i, "没有拿到锁,cmd=", newLogEntry.Command.(int))
+			//				continue
+			//			}
+			//			go func(tmpI int) {
+			//				rf.sendLogEntry(tmpNextIndex, initTerm, tmpI, appendEntryResult)
+			//				rf.unlockFollowerAppendEntry(tmpI)
+			//			}(i)
 		}
 	}
 	succ := 1
 	major := (len(rf.peers) + 1) / 2
 	fail := 0
-	for reply := range appendEntryResult {
-		if reply.Succ == true {
-			succ++
-		} else if reply.Term > rf.getRaftTerm() {
-			rf.setRaftTerm(reply.Term)
-			rf.becomeFollower(NONE)
-			BPrintf("term=%d,role=%s,rf=%d 在追加日志的过程中，发现更高的term，退回follower", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
-			//			close(appendEntryResult)
-			break
-		} else if reply.Term == -999 {
-			fail++
+
+	for outComingResult := range rf.getLogOutComingChan() {
+		inputLogEntry := outComingResult.InputLogEntry
+		if inputLogEntry.Index == newLogEntry.Index {
+			reply := outComingResult.Reply
+			if reply.Succ == true {
+				succ++
+			} else if reply.Term > rf.getRaftTerm() {
+				rf.setRaftTerm(reply.Term)
+				rf.becomeFollower(NONE)
+				BPrintf("term=%d,role=%s,rf=%d 在追加日志的过程中，发现更高的term，退回follower", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
+				break
+			} else if reply.Term == -999 {
+				fail++
+			}
 		}
 
 		if succ >= major {
+			//			if succ == 3 { //把这里改成强同步，就可以避免并发问题
 			//			BPrintf("term=%d,role=%s,rf=%d 大多数的节点已经接收到日志，耗时=%d,succ=", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, (GetNowMilliTime() - begin), succ)
 			//			rf.applyMsg2StateMachine(newLogEntry)
 			//这里加的可不一定是1啊兄弟
 			rf.updateCommitIndex(rf.getLogEntryLength() - 1)
 			//			close(appendEntryResult)
 			break
+			//			}
 		}
 		if fail >= major {
 			break
@@ -922,10 +1005,10 @@ func (rf *Raft) startElection() {
 	if succ >= majority {
 		rf.becomeLeader()
 		rf.initNextIndex()
+		rf.initCoroutine4EntrySubmit()
 		//		DPrintf("term=%d,role=%s,rf=%d 成为leader,耗时%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, costTime)
 		BPrintf("term=%d,role=%s,rf=%d 成为leader,耗时%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, costTime)
 		go rf.maintainLeader()
-
 	} else {
 		if biggerTermFlag {
 			DPrintf("term=%d,role=%s,rf=%d 候选者检测到了更高的term，退化为follower，耗时%d", rf.getRaftTerm(), getRole(rf.getRaftRole()),
@@ -961,7 +1044,7 @@ func (rf *Raft) maintainLeader() {
 		currentTerm := req.Term
 		n := len(rf.peers)
 		chnResult := make(chan *AppendEntriesReply, n)
-		DPrintf("term=%d,role=%s,rf=%d 开始发送leader心跳", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me)
+		DPrintf("term=%d,role=%s,rf=%d 开始发送leader心跳,len(entry)=%d", rf.getRaftTerm(), getRole(rf.getRaftRole()), rf.me, rf.getLogEntryLength())
 		majority := (len(rf.peers) + 1) / 2
 		for index := range rf.peers {
 			tmpIndex := index

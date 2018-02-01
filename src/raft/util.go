@@ -13,7 +13,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 // Debugging
-const DebugB = 1
+const DebugB = 0
 
 func BPrintf(format string, a ...interface{}) (n int, err error) {
 	if DebugB > 0 {
@@ -22,7 +22,11 @@ func BPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const AllDebug = 0
+
 func AllPrintf(format string, a ...interface{}) {
-	log.Printf(format, a...)
+	if AllDebug > 0 {
+		log.Printf(format, a...)
+	}
 	return
 }

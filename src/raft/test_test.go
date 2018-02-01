@@ -210,7 +210,7 @@ func TestConcurrentStarts2B(t *testing.T) {
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
 
-	fmt.Printf("Test (2B): concurrent Start()s ...\n")
+	fmt.Printf("Test (2B): concurrent Start() ...\n")
 
 	var success bool
 loop:
